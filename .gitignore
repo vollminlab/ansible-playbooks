@@ -1,0 +1,17 @@
+# Ansible runtime files
+*.retry
+.ansible/
+
+# Vault secrets - never commit plaintext vault passwords
+vault_pass.txt
+.vault_pass
+group_vars/*/vault.yml
+host_vars/*/vault.yml
+
+# Logs
+*.log
+
+# Editor cruft
+.vscode/
+*.swp
+*~

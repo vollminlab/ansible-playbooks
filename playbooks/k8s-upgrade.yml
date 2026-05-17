@@ -40,7 +40,7 @@
         var: upgrade_apply.stdout_lines
 
     - name: Drain k8scp01
-      command: kubectl drain k8scp01 --ignore-daemonsets --delete-emptydir-data --force
+      command: kubectl drain k8scp01 --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
       become: false
 
@@ -105,7 +105,7 @@
       changed_when: true
 
     - name: Drain {{ short_name }}
-      command: kubectl drain {{ short_name }} --ignore-daemonsets --delete-emptydir-data --force
+      command: kubectl drain {{ short_name }} --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
       become: false
 
@@ -140,7 +140,7 @@
 
 - name: Upgrade worker nodes
   hosts: workers
-  serial: 2
+  serial: 1
   become: true
   vars:
     short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
@@ -170,7 +170,7 @@
       changed_when: true
 
     - name: Drain {{ short_name }}
-      command: kubectl drain {{ short_name }} --ignore-daemonsets --delete-emptydir-data --force
+      command: kubectl drain {{ short_name }} --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
       become: false
 
@@ -200,5 +200,17 @@
 
     - name: Wait for {{ short_name }} to be Ready
       command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=120s
+      delegate_to: localhost
+      become: false
+
+    - name: Wait for all Longhorn volumes to be healthy
+      shell: >
+        kubectl get volumes.longhorn.io -A --no-headers
+        -o custom-columns='ROBUSTNESS:.status.robustness'
+        | grep -v healthy | wc -l
+      register: degraded_count
+      until: degraded_count.stdout | trim == "0"
+      retries: 120
+      delay: 30
       delegate_to: localhost
       become: false

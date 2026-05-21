@@ -93,15 +93,27 @@
         daemon_reload: yes
         state: restarted
 
+    - name: Wait for k8scp01 API server to initialize after kubelet restart
+      pause:
+        seconds: 30
+
     - name: Uncordon k8scp01
       command: kubectl uncordon k8scp01
       delegate_to: localhost
       become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 10
+      delay: 15
 
     - name: Wait for k8scp01 to be Ready
-      command: kubectl wait --for=condition=Ready node/k8scp01 --timeout=120s
+      command: kubectl wait --for=condition=Ready node/k8scp01 --timeout=30s
       delegate_to: localhost
       become: false
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 12
+      delay: 15
 
 - name: Upgrade remaining control plane nodes
   hosts: k8scp02.vollminlab.com,k8scp03.vollminlab.com
@@ -188,15 +200,27 @@
         daemon_reload: yes
         state: restarted
 
+    - name: Wait for {{ short_name }} API server to initialize after kubelet restart
+      pause:
+        seconds: 30
+
     - name: Uncordon {{ short_name }}
       command: kubectl uncordon {{ short_name }}
       delegate_to: localhost
       become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 10
+      delay: 15
 
     - name: Wait for {{ short_name }} to be Ready
-      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=120s
+      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=30s
       delegate_to: localhost
       become: false
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 12
+      delay: 15
 
 - name: Upgrade worker nodes
   hosts: workers
@@ -257,11 +281,19 @@
       command: kubectl uncordon {{ short_name }}
       delegate_to: localhost
       become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 10
+      delay: 15
 
     - name: Wait for {{ short_name }} to be Ready
-      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=120s
+      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=30s
       delegate_to: localhost
       become: false
+      register: wait_result
+      until: wait_result.rc == 0
+      retries: 12
+      delay: 15
 
     - name: Wait for all Longhorn volumes to be healthy
       shell: >

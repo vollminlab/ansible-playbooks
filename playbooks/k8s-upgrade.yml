@@ -318,14 +318,74 @@
       retries: 12
       delay: 15
 
-    - name: Wait for all Longhorn volumes to be healthy
+    - name: Wait for all Longhorn volumes to be healthy (up to 30 min)
       shell: >
         kubectl get volumes.longhorn.io -A --no-headers
         -o custom-columns='ROBUSTNESS:.status.robustness'
         | grep -v healthy | wc -l
-      register: degraded_count
-      until: degraded_count.stdout | trim == "0"
-      retries: 120
+      register: longhorn_degraded
+      until: longhorn_degraded.stdout | trim == "0"
+      retries: 60
       delay: 30
       delegate_to: localhost
       become: false
+      ignore_errors: true
+
+    - name: Relocate stopped replicas stuck on disk-pressure nodes
+      shell: |
+        relocated=0
+        while IFS=$'\t' read -r name state node; do
+          [ "$state" = "stopped" ] || continue
+          sched=$(kubectl get nodes.longhorn.io "$node" -n longhorn-system \
+            -o jsonpath='{range .status.diskStatus.*}{.conditions[?(@.type=="Schedulable")].status}{end}' 2>/dev/null)
+          [ "$sched" = "False" ] || continue
+          kubectl delete replica.longhorn.io "$name" -n longhorn-system --ignore-not-found
+          relocated=$((relocated + 1))
+        done < <(kubectl get replicas.longhorn.io -n longhorn-system \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.currentState}{"\t"}{.spec.nodeID}{"\n"}{end}')
+        echo "$relocated"
+      register: relocated_count
+      delegate_to: localhost
+      become: false
+      changed_when: relocated_count.stdout | trim | int > 0
+      when: longhorn_degraded.failed
+
+    - name: Wait for Longhorn volumes after replica relocation (up to 15 min)
+      shell: >
+        kubectl get volumes.longhorn.io -A --no-headers
+        -o custom-columns='ROBUSTNESS:.status.robustness'
+        | grep -v healthy | wc -l
+      register: longhorn_degraded_post
+      until: longhorn_degraded_post.stdout | trim == "0"
+      retries: 30
+      delay: 30
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+      when: longhorn_degraded.failed and (relocated_count.changed | default(false))
+
+    - name: Fail if any Longhorn volumes are faulted
+      shell: >
+        kubectl get volumes.longhorn.io -A --no-headers
+        -o custom-columns='ROBUSTNESS:.status.robustness'
+        | grep faulted | wc -l
+      register: longhorn_faulted
+      failed_when: longhorn_faulted.stdout | trim | int > 0
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Report any volumes still degraded after wait (non-faulted, proceeding)
+      shell: >
+        kubectl get volumes.longhorn.io -A --no-headers
+        -o custom-columns='ROBUSTNESS:.status.robustness'
+        | grep -v healthy | wc -l
+      register: longhorn_still_degraded
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Warn if volumes still degraded but not faulted
+      debug:
+        msg: "WARNING: {{ longhorn_still_degraded.stdout | trim }} volume(s) still degraded — no faulted volumes, proceeding to next node"
+      when: longhorn_still_degraded.stdout | trim | int > 0

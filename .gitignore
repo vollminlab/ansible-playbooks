@@ -11,6 +11,9 @@ host_vars/*/vault.yml
 # Logs
 *.log
 
+# Git worktrees
+.worktrees/
+
 # Editor cruft
 .vscode/
 *.swp

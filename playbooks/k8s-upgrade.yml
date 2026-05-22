@@ -319,10 +319,21 @@
       delay: 15
 
     - name: Wait for all Longhorn volumes to be healthy (up to 30 min)
-      shell: >
-        kubectl get volumes.longhorn.io -A --no-headers
-        -o custom-columns='ROBUSTNESS:.status.robustness'
-        | grep -v healthy | wc -l
+      shell: |
+        unhealthy=$(kubectl get volumes.longhorn.io -A --no-headers \
+          -o custom-columns='ROBUSTNESS:.status.robustness' | grep -v healthy | wc -l)
+        [ "$unhealthy" -eq 0 ] && echo "0" && exit 0
+        sched_fail=0
+        while IFS= read -r vol; do
+          reason=$(kubectl get volume.longhorn.io "$vol" -n longhorn-system \
+            -o jsonpath='{.status.conditions[?(@.type=="Scheduled")].reason}' 2>/dev/null)
+          [ "$reason" = "ReplicaSchedulingFailure" ] && sched_fail=$((sched_fail + 1))
+        done < <(kubectl get volumes.longhorn.io -A --no-headers \
+          -o jsonpath='{range .items[?(@.status.robustness!="healthy")]}{.metadata.name}{"\n"}{end}')
+        [ "$sched_fail" -eq "$unhealthy" ] && echo "0" && exit 0
+        echo "$unhealthy"
+      args:
+        executable: /bin/bash
       register: longhorn_degraded
       until: longhorn_degraded.stdout | trim == "0"
       retries: 60
@@ -330,6 +341,28 @@
       delegate_to: localhost
       become: false
       ignore_errors: true
+
+    - name: Report volumes skipped due to ReplicaSchedulingFailure (insufficient storage)
+      shell: |
+        kubectl get volumes.longhorn.io -A --no-headers \
+          -o jsonpath='{range .items[?(@.status.robustness!="healthy")]}{.metadata.name}{"\n"}{end}' | \
+          while IFS= read -r vol; do
+            reason=$(kubectl get volume.longhorn.io "$vol" -n longhorn-system \
+              -o jsonpath='{.status.conditions[?(@.type=="Scheduled")].reason}' 2>/dev/null)
+            [ "$reason" = "ReplicaSchedulingFailure" ] && echo "$vol"
+          done || true
+      args:
+        executable: /bin/bash
+      register: sched_fail_vols
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Warn about scheduling failure volumes (cluster lacks storage for 3rd replica)
+      debug:
+        msg: "WARNING: {{ item }} is degraded due to ReplicaSchedulingFailure — cluster lacks storage for a 3rd replica, proceeding"
+      loop: "{{ sched_fail_vols.stdout_lines }}"
+      when: sched_fail_vols.stdout_lines | length > 0
 
     - name: Relocate stopped replicas stuck on disk-pressure nodes
       shell: |
@@ -344,6 +377,8 @@
         done < <(kubectl get replicas.longhorn.io -n longhorn-system \
           -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.currentState}{"\t"}{.spec.nodeID}{"\n"}{end}')
         echo "$relocated"
+      args:
+        executable: /bin/bash
       register: relocated_count
       delegate_to: localhost
       become: false

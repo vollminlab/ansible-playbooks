@@ -344,6 +344,8 @@
         done < <(kubectl get replicas.longhorn.io -n longhorn-system \
           -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.currentState}{"\t"}{.spec.nodeID}{"\n"}{end}')
         echo "$relocated"
+      args:
+        executable: /bin/bash
       register: relocated_count
       delegate_to: localhost
       become: false

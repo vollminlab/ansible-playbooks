@@ -318,6 +318,56 @@
       retries: 12
       delay: 15
 
+    - name: Wait for Longhorn instance manager pod to be Running on {{ short_name }}
+      shell: >
+        kubectl get pods -n longhorn-system
+        -l 'longhorn.io/component=instance-manager,longhorn.io/node={{ short_name }}'
+        --no-headers 2>/dev/null
+        | awk '$3=="Running"{c++} END{print c+0}'
+      register: lh_im_running
+      until: lh_im_running.stdout | trim | int > 0
+      retries: 20
+      delay: 15
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Get current Longhorn instance manager pod IPs on {{ short_name }}
+      shell: >
+        kubectl get pods -n longhorn-system
+        -l 'longhorn.io/component=instance-manager,longhorn.io/node={{ short_name }}'
+        -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+        2>/dev/null
+      register: longhorn_im_ips
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Clean up stale Longhorn iSCSI sessions on {{ short_name }}
+      shell: |
+        cleaned=0
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          portal=$(echo "$line" | awk '{split($3, a, ":"); print a[1]}')
+          iqn=$(echo "$line" | awk '{print $4}')
+          echo "$iqn" | grep -q 'iqn.2019-10.io.longhorn' || continue
+          matched=0
+          for ip in $LH_IM_IPS; do
+            [ "$ip" = "$portal" ] && matched=1 && break
+          done
+          [ "$matched" -eq 1 ] && continue
+          iscsiadm -m node -T "$iqn" -p "$portal":3260 --logout 2>/dev/null || true
+          iscsiadm -m node -T "$iqn" -p "$portal":3260 --op=delete 2>/dev/null || true
+          cleaned=$((cleaned + 1))
+        done < <(iscsiadm -m session 2>/dev/null || true)
+        echo "cleaned=$cleaned"
+      args:
+        executable: /bin/bash
+      environment:
+        LH_IM_IPS: "{{ longhorn_im_ips.stdout_lines | join(' ') }}"
+      register: iscsi_cleanup
+      changed_when: "'cleaned=0' not in iscsi_cleanup.stdout"
+
     - name: Wait for all Longhorn volumes to be healthy (up to 30 min)
       shell: |
         unhealthy=$(kubectl get volumes.longhorn.io -A --no-headers \

@@ -112,6 +112,30 @@ What it does, per node (`serial: 1`):
 Idempotent: re-running is a no-op once applied. New nodes should run this
 playbook before joining production workloads.
 
+## Control-plane containerd upgrade
+
+`cp-containerd-upgrade.yml` brings the 3 control-plane nodes from containerd
+1.7.27 to 2.2.4 (the workers are already on 2.2.4). Roadmap item 7.2.
+
+```bash
+ansible-playbook playbooks/cp-containerd-upgrade.yml --ask-vault-pass
+```
+
+Why it's more careful than a worker upgrade despite being only 3 nodes:
+
+- Each CP node runs an **etcd member** as a static pod. Upgrading the
+  `containerd.io` package restarts containerd, which restarts every static pod
+  on that node. 3-node etcd tolerates only one member down, so it runs
+  `serial: 1` with an **etcd-health gate** before and after each node.
+- `/etc/containerd/config.toml` is a dpkg conffile that is locally modified (it
+  carries the Harbor pull-through mirror `config_path`). The upgrade runs with
+  `--force-confold` to keep the existing file, then **re-asserts and verifies**
+  the mirror config before restarting — so the docker.io proxy can't silently
+  regress on these nodes.
+
+Run only when all etcd members are healthy. The control plane stays available
+throughout (nodes are drained and uncordoned one at a time).
+
 ## SSH key
 
 `~/.ssh/ansible_k8s_ed25519` is a dedicated ed25519 key pair generated on ansible01.

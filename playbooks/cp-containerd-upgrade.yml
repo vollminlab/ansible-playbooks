@@ -1,0 +1,175 @@
+---
+# Upgrade containerd on the control-plane nodes from 1.7.27 to 2.2.4, matching
+# the workers (which are already on 2.2.4 from the docker.com apt repo).
+#
+# Roadmap 7.2 (containerd normalization). The 6 workers were done during the
+# 2026-05-30 maintenance; this finishes the 3 control-plane nodes.
+#
+# Why careful, despite being "only 3 nodes":
+#   - Each CP node runs an etcd member as a static pod. Upgrading the
+#     containerd.io package stops containerd, which restarts every static pod
+#     on that node (etcd, kube-apiserver, controller-manager, scheduler).
+#   - 3-node etcd tolerates exactly one member down (quorum 2/3), so this MUST
+#     be serial: 1 with an etcd-health gate between nodes.
+#   - /etc/containerd/config.toml is a dpkg conffile AND is locally modified
+#     (it carries the Harbor pull-through mirror config_path = certs.d). The
+#     upgrade is run with --force-confold so dpkg keeps the existing file (new
+#     default lands as config.toml.dpkg-dist). We then re-assert + verify the
+#     mirror config before restarting, so a clobber can never silently regress
+#     the docker.io proxy on these nodes.
+#
+# Run from ~/ansible-playbooks/ on ansible01 (cluster healthy, all etcd members
+# healthy):
+#   ansible-playbook playbooks/cp-containerd-upgrade.yml --ask-vault-pass
+
+- name: Upgrade control-plane containerd to 2.2.4
+  hosts: control_plane
+  serial: 1
+  become: true
+  vars:
+    target_containerd: "2.2.4-1~ubuntu.24.04~noble"
+    proxy_endpoint: "https://harbor.vollminlab.com/v2/dockerhub-proxy"
+    short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
+  tasks:
+    - name: Verify etcd cluster is fully healthy before touching this node
+      # All 3 members must be healthy before we take one down. Runs against the
+      # live etcd static pod via kubectl from ansible01.
+      shell: |
+        set -o pipefail
+        pod=$(kubectl get pods -n kube-system -l component=etcd \
+          -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n kube-system "$pod" -- etcdctl \
+          --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/server.crt \
+          --key /etc/kubernetes/pki/etcd/server.key \
+          endpoint health --cluster 2>&1
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      register: etcd_health
+      # Every endpoint line must report "is healthy"; fail if any "unhealthy".
+      failed_when: >-
+        etcd_health.rc != 0 or
+        'unhealthy' in etcd_health.stdout or
+        (etcd_health.stdout_lines | select('search', 'is healthy') | list | length) < 3
+      changed_when: false
+
+    - name: Drain {{ short_name }}
+      command: >-
+        kubectl drain {{ short_name }}
+        --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
+      delegate_to: localhost
+      become: false
+
+    - name: Unhold containerd.io
+      command: apt-mark unhold containerd.io
+      changed_when: true
+
+    - name: Upgrade containerd.io to {{ target_containerd }} (keep existing config.toml)
+      apt:
+        name: "containerd.io={{ target_containerd }}"
+        state: present
+        update_cache: yes
+        # --force-confold: keep the locally-modified config.toml (which holds the
+        # Harbor mirror config_path); new default is written as .dpkg-dist.
+        dpkg_options: "force-confdef,force-confold"
+
+    - name: Re-hold containerd.io
+      command: apt-mark hold containerd.io
+      changed_when: true
+
+    - name: Ensure CRI registry config_path points at certs.d (re-assert post-upgrade)
+      # If the upgrade replaced config.toml despite --force-confold, this restores
+      # the mirror. Idempotent no-op when the line is already correct.
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '(\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\]\n\s*config_path = )""'
+        replace: '\1"/etc/containerd/certs.d"'
+
+    - name: Verify CRI registry config_path is set to certs.d
+      command: grep -c 'config_path = "/etc/containerd/certs.d"' /etc/containerd/config.toml
+      register: certs_d_config_path
+      changed_when: false
+      failed_when: certs_d_config_path.stdout | trim | int != 1
+
+    - name: Ensure docker.io hosts.toml is present (re-assert post-upgrade)
+      copy:
+        dest: /etc/containerd/certs.d/docker.io/hosts.toml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server = "https://registry-1.docker.io"
+
+          [host."{{ proxy_endpoint }}"]
+            capabilities = ["pull", "resolve"]
+            override_path = true
+
+    - name: Restart containerd with the new version
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for containerd socket to come back
+      command: crictl --runtime-endpoint unix:///run/containerd/containerd.sock info
+      register: crictl_info
+      until: crictl_info.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Verify containerd is now {{ target_containerd }}
+      command: containerd --version
+      register: ctd_version
+      changed_when: false
+      failed_when: "'v2.2.4' not in ctd_version.stdout"
+
+    - name: Verify pull-through still works (busybox via the Harbor proxy)
+      command: crictl pull docker.io/library/busybox:latest
+      changed_when: false
+
+    - name: Wait for {{ short_name }} kubelet to report Ready
+      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=90s
+      delegate_to: localhost
+      become: false
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: Wait for this node's etcd member to rejoin and all members healthy
+      shell: |
+        set -o pipefail
+        pod=$(kubectl get pods -n kube-system -l component=etcd \
+          --field-selector spec.nodeName={{ short_name }} \
+          -o jsonpath='{.items[0].metadata.name}')
+        [ -n "$pod" ] || { echo "etcd pod not yet scheduled on {{ short_name }}"; exit 1; }
+        kubectl exec -n kube-system "$pod" -- etcdctl \
+          --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/server.crt \
+          --key /etc/kubernetes/pki/etcd/server.key \
+          endpoint health --cluster 2>&1
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      register: etcd_health_post
+      until: >-
+        etcd_health_post.rc == 0 and
+        'unhealthy' not in etcd_health_post.stdout and
+        (etcd_health_post.stdout_lines | select('search', 'is healthy') | list | length) >= 3
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Uncordon {{ short_name }}
+      command: kubectl uncordon {{ short_name }}
+      delegate_to: localhost
+      become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 10
+      delay: 15

@@ -20,6 +20,22 @@ ansible01 must have:
 - kubectl + `~/.kube/config` pointing at the cluster
 - `~/.ssh/ansible_k8s_ed25519` — the dedicated Ansible SSH key (authorized on all nodes)
 
+## Vault password — required for every playbook
+
+Each node's `ansible_become_password` is stored as an inline `!vault`-encrypted
+value in `inventory/host_vars/<host>/vars.yml`. Every playbook here uses
+`become: true`, so **all runs must supply the vault password** or they fail at
+"Gathering Facts" with `Attempting to decrypt but no vault secrets found`.
+
+Append `--ask-vault-pass` to prompt for it interactively:
+
+```bash
+ansible-playbook playbooks/<playbook>.yml --ask-vault-pass
+```
+
+Or point at a vault password file (e.g. `--vault-password-file ~/.vault_pass`,
+or set `ANSIBLE_VAULT_PASSWORD_FILE`).
+
 ## Kubernetes upgrade
 
 The cluster runs one Kubernetes minor version. To upgrade, run four sequential hops.
@@ -35,7 +51,9 @@ Current versions (as of 2026-05-17):
 | 3   | 1.34  | 1.35.5  | `ansible-playbook playbooks/k8s-upgrade.yml -e "target_version=1.35.5  target_minor=1.35"` |
 | 4   | 1.35  | 1.36.1  | `ansible-playbook playbooks/k8s-upgrade.yml -e "target_version=1.36.1  target_minor=1.36"` |
 
-Run from `~/ansible-playbooks/` on ansible01. Wait for each hop to complete before starting the next.
+Run from `~/ansible-playbooks/` on ansible01, appending `--ask-vault-pass` to
+each command (see [Vault password](#vault-password--required-for-every-playbook)).
+Wait for each hop to complete before starting the next.
 
 ### What each hop does
 
@@ -78,7 +96,7 @@ be public. Harbor uses a publicly-trusted Let's Encrypt cert, so no CA injection
 is needed on the nodes.
 
 ```bash
-ansible-playbook playbooks/containerd-dockerhub-mirror.yml
+ansible-playbook playbooks/containerd-dockerhub-mirror.yml --ask-vault-pass
 ```
 
 What it does, per node (`serial: 1`):

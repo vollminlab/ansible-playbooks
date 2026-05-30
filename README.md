@@ -6,10 +6,11 @@ Ansible automation for the Vollminlab homelab. Runs from `ansible01.vollminlab.c
 
 ```
 inventory/
-  hosts.ini          # all managed hosts, grouped by role
+  hosts.ini                       # all managed hosts, grouped by role
 playbooks/
-  k8s-upgrade.yml    # Kubernetes minor-version upgrade, one hop at a time
-ansible.cfg          # default inventory, SSH key, connection settings
+  k8s-upgrade.yml                 # Kubernetes minor-version upgrade, one hop at a time
+  containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
+ansible.cfg                       # default inventory, SSH key, connection settings
 ```
 
 ## Prerequisites
@@ -59,6 +60,39 @@ If a newer patch is available when you run a hop:
 curl -sL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Packages \
   | grep -A2 "^Package: kubeadm$" | grep Version | sort -V | tail -1
 ```
+
+## Docker Hub pull-through cache (containerd mirror)
+
+`containerd-dockerhub-mirror.yml` configures every node's containerd to pull
+`docker.io` images through the Harbor `dockerhub-proxy` project. This caches
+Docker Hub images in Harbor after the first pull, eliminating the anonymous
+rate-limit `ImagePullBackOff` storms that hit on mass reschedules (the cluster
+shares one egress IP against Docker Hub's ~100 anonymous pulls/6h limit).
+
+It is transparent — image refs stay `docker.io/...` and containerd silently
+resolves them via Harbor. `registry-1.docker.io` remains the fallback host, so
+if Harbor is down, pulls go directly to Docker Hub.
+
+Prereq: the Harbor proxy-cache project must exist (created in the k8s repo) and
+be public. Harbor uses a publicly-trusted Let's Encrypt cert, so no CA injection
+is needed on the nodes.
+
+```bash
+ansible-playbook playbooks/containerd-dockerhub-mirror.yml
+```
+
+What it does, per node (`serial: 1`):
+
+1. Sets `config_path = "/etc/containerd/certs.d"` in the CRI registry block of
+   `/etc/containerd/config.toml` (the identical line under the transfer plugin
+   is deliberately left untouched).
+2. Writes `/etc/containerd/certs.d/docker.io/hosts.toml` pointing at the proxy.
+3. Restarts containerd (no drain — a containerd restart does not evict pods).
+4. Verifies `crictl pull docker.io/library/busybox:latest` succeeds and the node
+   returns Ready before moving to the next node.
+
+Idempotent: re-running is a no-op once applied. New nodes should run this
+playbook before joining production workloads.
 
 ## SSH key
 

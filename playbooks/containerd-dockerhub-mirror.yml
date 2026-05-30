@@ -1,0 +1,105 @@
+---
+# Configure containerd on every node to pull docker.io images through the
+# Harbor Docker Hub pull-through cache project (dockerhub-proxy).
+#
+# Why: the cluster shares one egress IP against Docker Hub's ~100 anonymous
+# pulls/6h limit. Mass reschedules (node maintenance, reboots, Cilium migration)
+# exhaust it -> ImagePullBackOff storms (hit 3x during 2026-05-30 maintenance).
+# Routing docker.io through Harbor means images are cached after the first pull
+# and served in-cluster with no upstream rate limit.
+#
+# This is transparent: image refs stay docker.io/...; containerd silently
+# resolves them via Harbor. registry-1.docker.io stays as the fallback host,
+# so if Harbor is unavailable containerd pulls directly from Docker Hub.
+#
+# Prereq: Harbor proxy-cache project must exist (k8s repo PR #809) and be public.
+# Harbor TLS is a publicly-trusted Let's Encrypt wildcard cert, so no CA
+# injection or skip_verify is needed on the nodes.
+#
+# Run from ~/ansible-playbooks/ on ansible01:
+#   ansible-playbook playbooks/containerd-dockerhub-mirror.yml
+#
+# Idempotent: re-running is a no-op once applied. containerd restart does NOT
+# evict pods (kubelet reconnects in seconds), so no drain is required.
+
+- name: Route docker.io through the Harbor pull-through cache
+  hosts: k8s
+  serial: 1
+  become: true
+  vars:
+    short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
+    proxy_endpoint: "https://harbor.vollminlab.com/v2/dockerhub-proxy"
+  tasks:
+    - name: Enable containerd registry config_path (CRI registry block only)
+      replace:
+        path: /etc/containerd/config.toml
+        # Anchored to the CRI registry section so the identical config_path = ""
+        # under [plugins."io.containerd.transfer.v1.local"] is never touched.
+        regexp: '(\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\]\n\s*config_path = )""'
+        replace: '\1"/etc/containerd/certs.d"'
+      register: config_path_change
+
+    - name: Verify CRI registry config_path now points at certs.d
+      command: grep -c 'config_path = "/etc/containerd/certs.d"' /etc/containerd/config.toml
+      register: certs_d_config_path
+      changed_when: false
+      failed_when: certs_d_config_path.stdout | trim | int != 1
+
+    - name: Verify the transfer plugin config_path = "" was NOT modified
+      # Two empty config_path lines existed pre-change (CRI registry + transfer
+      # plugin). After the targeted replace, exactly one must remain.
+      command: grep -c 'config_path = ""' /etc/containerd/config.toml
+      register: empty_config_paths
+      changed_when: false
+      failed_when: empty_config_paths.stdout | trim | int != 1
+
+    - name: Create docker.io certs.d directory
+      file:
+        path: /etc/containerd/certs.d/docker.io
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write docker.io hosts.toml pointing at the Harbor proxy
+      copy:
+        dest: /etc/containerd/certs.d/docker.io/hosts.toml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server = "https://registry-1.docker.io"
+
+          [host."{{ proxy_endpoint }}"]
+            capabilities = ["pull", "resolve"]
+            override_path = true
+      register: hosts_toml_change
+
+    - name: Restart containerd if config changed
+      systemd:
+        name: containerd
+        state: restarted
+      when: config_path_change.changed or hosts_toml_change.changed
+
+    - name: Wait for containerd socket to come back
+      command: crictl --runtime-endpoint unix:///run/containerd/containerd.sock info
+      register: crictl_info
+      until: crictl_info.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Verify pull-through works (busybox via the Harbor proxy)
+      command: crictl pull docker.io/library/busybox:latest
+      register: proxy_pull
+      changed_when: false
+
+    - name: Wait for {{ short_name }} to report Ready
+      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=60s
+      delegate_to: localhost
+      become: false
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: false

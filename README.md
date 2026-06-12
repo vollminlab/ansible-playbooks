@@ -9,6 +9,8 @@ inventory/
   hosts.ini                       # all managed hosts, grouped by role
 playbooks/
   k8s-upgrade.yml                 # Kubernetes minor-version upgrade, one hop at a time
+  os-patch.yml                    # rolling apt full-upgrade + reboot-if-required (general OS patcher)
+  cp-containerd-upgrade.yml       # control-plane containerd 1.7 -> 2.2 upgrade
   containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
 ansible.cfg                       # default inventory, SSH key, connection settings
 ```
@@ -78,6 +80,42 @@ If a newer patch is available when you run a hop:
 curl -sL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Packages \
   | grep -A2 "^Package: kubeadm$" | grep Version | sort -V | tail -1
 ```
+
+## OS patching (apt full-upgrade + reboot)
+
+`os-patch.yml` is the **general, reusable** OS patcher — routine Ubuntu point
+upgrades (e.g. 24.04.x → 24.04.4), kernel/security updates, any `apt
+full-upgrade` that may need a reboot. It is **not** Kubernetes-version-specific
+(it never touches kubeadm/kubelet/kubectl and never rebinds CP metrics — an apt
+upgrade preserves the static-pod manifests).
+
+```bash
+# all control-plane nodes, one at a time
+ansible-playbook playbooks/os-patch.yml -e patch_hosts=control_plane --ask-vault-pass
+# a single node
+ansible-playbook playbooks/os-patch.yml -e patch_hosts=k8scp01.vollminlab.com --ask-vault-pass
+# all workers
+ansible-playbook playbooks/os-patch.yml -e patch_hosts=workers --ask-vault-pass
+```
+
+`patch_hosts` defaults to `k8s` (every node). Always `serial: 1`. Per node it
+drains, runs `apt full-upgrade` (with `force-confdef,force-confold` so a conffile
+prompt never blocks the run), reboots only if `/var/run/reboot-required` is
+present, waits for the node to report Ready, then uncordons.
+
+The gate after each node depends on the node's role:
+
+- **Control plane** — etcd-health gate **before** drain (all 3 members healthy)
+  and an etcd-rejoin gate **after** reboot, because a reboot restarts the etcd
+  static pod and 3-node etcd tolerates only one member down.
+- **Workers** — a Longhorn gate: cleans up stale iSCSI sessions left by the
+  reboot, then blocks until every volume is healthy and **hard-fails on any
+  faulted volume** before moving to the next node. Volumes degraded only by
+  `ReplicaSchedulingFailure` (no room for a 3rd replica) are treated as
+  acceptable and don't block the roll.
+
+Run only when the cluster is healthy (all etcd members healthy, all Longhorn
+volumes healthy). The cluster stays available throughout.
 
 ## Docker Hub pull-through cache (containerd mirror)
 

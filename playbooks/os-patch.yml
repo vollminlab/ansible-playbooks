@@ -1,0 +1,260 @@
+---
+# Rolling OS patch (apt full-upgrade + reboot-if-required) for cluster nodes.
+#
+# This is the GENERAL, reusable OS patcher — it is NOT k8s-version-specific.
+# Use it for routine Ubuntu point upgrades (e.g. 24.04.x -> 24.04.4), kernel/
+# security updates, or any apt full-upgrade that may require a reboot.
+#
+# Safety model — one node at a time (serial: 1), with the right gate per role:
+#   - Control-plane nodes: each runs an etcd member as a static pod. A reboot
+#     restarts every static pod on the node. 3-node etcd tolerates exactly one
+#     member down (quorum 2/3), so CP nodes MUST go one at a time with an
+#     etcd-health gate BEFORE draining and an etcd-rejoin gate AFTER reboot.
+#   - Worker nodes: a reboot detaches Longhorn volumes. Rebooting a second
+#     replica-holding node before the first's replicas have rebuilt risks
+#     degraded -> faulted volumes. So workers get a Longhorn-health gate that
+#     blocks until every volume is healthy (and hard-fails on any faulted
+#     volume) before the play moves to the next node. A reboot can also leave
+#     stale iSCSI sessions pointing at the pre-reboot instance-manager IPs;
+#     those are cleaned up before the health wait.
+#
+# Unlike k8s-upgrade.yml this play does NOT touch kubeadm/kubelet/kubectl, does
+# NOT run kubeadm upgrade, and does NOT rebind CP metrics — an OS apt upgrade
+# preserves the static-pod manifests, so the 0.0.0.0 metrics bindings survive.
+#
+# Target selection — defaults to ALL nodes; override to scope a run:
+#   # all control-plane nodes, one at a time
+#   ansible-playbook playbooks/os-patch.yml -e patch_hosts=control_plane --ask-vault-pass
+#   # a single node
+#   ansible-playbook playbooks/os-patch.yml -e patch_hosts=k8scp01.vollminlab.com --ask-vault-pass
+#   # all workers
+#   ansible-playbook playbooks/os-patch.yml -e patch_hosts=workers --ask-vault-pass
+#
+# Run from ~/ansible-playbooks/ on ansible01 with the cluster healthy (all etcd
+# members healthy, all Longhorn volumes healthy). kubectl gates run from
+# localhost (ansible01's kubeconfig).
+
+- name: Rolling OS patch
+  hosts: "{{ patch_hosts | default('k8s') }}"
+  serial: 1
+  become: true
+  vars:
+    short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
+    is_control_plane: "{{ inventory_hostname in groups['control_plane'] }}"
+    is_worker: "{{ inventory_hostname in groups['workers'] }}"
+  tasks:
+    # ---- Pre-flight gate (control plane only) ----------------------------------
+    - name: Verify etcd cluster is fully healthy before touching this CP node
+      # All 3 members must be healthy before we take one down. Runs against the
+      # live etcd static pod via kubectl from ansible01.
+      shell: |
+        set -o pipefail
+        pod=$(kubectl get pods -n kube-system -l component=etcd \
+          -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n kube-system "$pod" -- etcdctl \
+          --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/server.crt \
+          --key /etc/kubernetes/pki/etcd/server.key \
+          endpoint health --cluster 2>&1
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      register: etcd_health
+      failed_when: >-
+        etcd_health.rc != 0 or
+        'unhealthy' in etcd_health.stdout or
+        (etcd_health.stdout_lines | select('search', 'is healthy') | list | length) < 3
+      changed_when: false
+      when: is_control_plane | bool
+
+    # ---- Drain -----------------------------------------------------------------
+    - name: Drain {{ short_name }}
+      command: >-
+        kubectl drain {{ short_name }}
+        --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
+      delegate_to: localhost
+      become: false
+
+    # ---- apt full-upgrade ------------------------------------------------------
+    - name: apt-get update
+      apt:
+        update_cache: yes
+
+    - name: apt full-upgrade (keep existing conffiles on prompt)
+      apt:
+        upgrade: full
+        autoremove: yes
+        # Non-interactive: keep locally-modified conffiles, take maintainer
+        # default only where there is no local change. Never block on a prompt.
+        dpkg_options: "force-confdef,force-confold"
+      register: apt_upgrade
+
+    - name: Show apt upgrade summary
+      debug:
+        var: apt_upgrade.stdout_lines
+      when: apt_upgrade.stdout_lines is defined
+
+    # ---- Reboot if the kernel/libs require it ----------------------------------
+    - name: Check whether a reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot {{ short_name }} (reboot-required flag present)
+      reboot:
+        msg: "Reboot triggered by os-patch.yml after apt full-upgrade"
+        reboot_timeout: 900
+        # Consider the node back when SSH is up and systemd reports running.
+        test_command: systemctl is-system-running --wait || true
+      when: reboot_required.stat.exists
+
+    - name: Note that no reboot was required
+      debug:
+        msg: "{{ short_name }}: no reboot-required flag, skipping reboot"
+      when: not reboot_required.stat.exists
+
+    # ---- Post-reboot: node Ready -----------------------------------------------
+    - name: Wait for {{ short_name }} kubelet to report Ready
+      command: kubectl wait --for=condition=Ready node/{{ short_name }} --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    # ---- Post-reboot gate (control plane only): etcd member rejoins ------------
+    - name: Wait for this node's etcd member to rejoin and all members healthy
+      shell: |
+        set -o pipefail
+        pod=$(kubectl get pods -n kube-system -l component=etcd \
+          --field-selector spec.nodeName={{ short_name }} \
+          -o jsonpath='{.items[0].metadata.name}')
+        [ -n "$pod" ] || { echo "etcd pod not yet scheduled on {{ short_name }}"; exit 1; }
+        kubectl exec -n kube-system "$pod" -- etcdctl \
+          --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/server.crt \
+          --key /etc/kubernetes/pki/etcd/server.key \
+          endpoint health --cluster 2>&1
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      register: etcd_health_post
+      until: >-
+        etcd_health_post.rc == 0 and
+        'unhealthy' not in etcd_health_post.stdout and
+        (etcd_health_post.stdout_lines | select('search', 'is healthy') | list | length) >= 3
+      retries: 20
+      delay: 15
+      changed_when: false
+      when: is_control_plane | bool
+
+    # ---- Uncordon --------------------------------------------------------------
+    - name: Uncordon {{ short_name }}
+      command: kubectl uncordon {{ short_name }}
+      delegate_to: localhost
+      become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 10
+      delay: 15
+
+    # ---- Post-reboot gate (workers only): Longhorn health ----------------------
+    - name: Wait for Longhorn instance manager pod to be Running on {{ short_name }}
+      shell: >
+        kubectl get pods -n longhorn-system
+        -l 'longhorn.io/component=instance-manager,longhorn.io/node={{ short_name }}'
+        --no-headers 2>/dev/null
+        | awk '$3=="Running"{c++} END{print c+0}'
+      register: lh_im_running
+      until: lh_im_running.stdout | trim | int > 0
+      retries: 20
+      delay: 15
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: is_worker | bool
+
+    - name: Get current Longhorn instance manager pod IPs on {{ short_name }}
+      shell: >
+        kubectl get pods -n longhorn-system
+        -l 'longhorn.io/component=instance-manager,longhorn.io/node={{ short_name }}'
+        -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+        2>/dev/null
+      register: longhorn_im_ips
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: is_worker | bool
+
+    - name: Clean up stale Longhorn iSCSI sessions on {{ short_name }} (pre-reboot IPs)
+      # A reboot detaches volumes; sessions to the old instance-manager IPs can
+      # linger. Log out / delete any Longhorn session whose portal is not a
+      # current instance-manager IP. Non-Longhorn sessions are left untouched.
+      shell: |
+        cleaned=0
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          portal=$(echo "$line" | awk '{split($3, a, ":"); print a[1]}')
+          iqn=$(echo "$line" | awk '{print $4}')
+          echo "$iqn" | grep -q 'iqn.2019-10.io.longhorn' || continue
+          matched=0
+          for ip in $LH_IM_IPS; do
+            [ "$ip" = "$portal" ] && matched=1 && break
+          done
+          [ "$matched" -eq 1 ] && continue
+          iscsiadm -m node -T "$iqn" -p "$portal":3260 --logout 2>/dev/null || true
+          iscsiadm -m node -T "$iqn" -p "$portal":3260 --op=delete 2>/dev/null || true
+          cleaned=$((cleaned + 1))
+        done < <(iscsiadm -m session 2>/dev/null || true)
+        echo "cleaned=$cleaned"
+      args:
+        executable: /bin/bash
+      environment:
+        LH_IM_IPS: "{{ longhorn_im_ips.stdout_lines | join(' ') }}"
+      register: iscsi_cleanup
+      changed_when: "'cleaned=0' not in iscsi_cleanup.stdout"
+      when: is_worker | bool
+
+    - name: Wait for all Longhorn volumes to be healthy (up to 30 min)
+      # Volumes degraded ONLY because the cluster lacks storage for a 3rd replica
+      # (ReplicaSchedulingFailure) are treated as acceptable — they will never go
+      # healthy and must not block the roll.
+      shell: |
+        unhealthy=$(kubectl get volumes.longhorn.io -A --no-headers \
+          -o custom-columns='ROBUSTNESS:.status.robustness' | grep -v healthy | wc -l)
+        [ "$unhealthy" -eq 0 ] && echo "0" && exit 0
+        sched_fail=0
+        while IFS= read -r vol; do
+          reason=$(kubectl get volume.longhorn.io "$vol" -n longhorn-system \
+            -o jsonpath='{.status.conditions[?(@.type=="Scheduled")].reason}' 2>/dev/null)
+          [ "$reason" = "ReplicaSchedulingFailure" ] && sched_fail=$((sched_fail + 1))
+        done < <(kubectl get volumes.longhorn.io -A --no-headers \
+          -o jsonpath='{range .items[?(@.status.robustness!="healthy")]}{.metadata.name}{"\n"}{end}')
+        [ "$sched_fail" -eq "$unhealthy" ] && echo "0" && exit 0
+        echo "$unhealthy"
+      args:
+        executable: /bin/bash
+      register: longhorn_degraded
+      until: longhorn_degraded.stdout | trim == "0"
+      retries: 60
+      delay: 30
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: is_worker | bool
+
+    - name: Fail if any Longhorn volumes are faulted
+      shell: >
+        kubectl get volumes.longhorn.io -A --no-headers
+        -o custom-columns='ROBUSTNESS:.status.robustness'
+        | grep faulted | wc -l
+      register: longhorn_faulted
+      failed_when: longhorn_faulted.stdout | trim | int > 0
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      when: is_worker | bool

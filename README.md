@@ -9,6 +9,7 @@ inventory/
   hosts.ini                       # all managed hosts, grouped by role
 playbooks/
   k8s-upgrade.yml                 # Kubernetes minor-version upgrade, one hop at a time
+  harden-cp-probes.yml            # widen apiserver/etcd liveness probes (anti-cascade)
   os-patch.yml                    # rolling apt full-upgrade + reboot-if-required (general OS patcher)
   cp-containerd-upgrade.yml       # control-plane containerd 1.7 -> 2.2 upgrade
   containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
@@ -61,7 +62,9 @@ Wait for each hop to complete before starting the next.
 
 1. Updates `/etc/apt/sources.list.d/kubernetes.list` to the new minor-version repo on every node
 2. Upgrades kubeadm, runs `kubeadm upgrade apply` on k8scp01, `kubeadm upgrade node` on the rest
-3. Drains each node, upgrades kubelet + kubectl, restarts kubelet, uncordons
+3. Re-applies CP static-pod customizations that kubeadm resets: rebinds etcd/controller-manager/scheduler
+   metrics to `0.0.0.0`, and re-hardens the apiserver/etcd liveness probes (see [probe hardening](#control-plane-probe-hardening))
+4. Drains each node, upgrades kubelet + kubectl, restarts kubelet, uncordons
 
 ### Before running
 
@@ -116,6 +119,28 @@ The gate after each node depends on the node's role:
 
 Run only when the cluster is healthy (all etcd members healthy, all Longhorn
 volumes healthy). The cluster stays available throughout.
+
+## Control-plane probe hardening
+
+`harden-cp-probes.yml` widens the kube-apiserver and etcd **liveness** probes so a
+transient etcd disk-latency blip can't kill the control plane. It raises each
+liveness `failureThreshold` from `8` to `24`; with `periodSeconds=10` that widens
+tolerance from ~80s to ~240s.
+
+**Why:** on 2026-06-19 a brief storage I/O stall spiked etcd WAL fsync to ~1s. All
+three apiservers' `/livez` failed, the kubelet SIGKILLed them, and every
+`--leader-elect` controller in the cluster restarted (11 `PodCrashLooping` alerts).
+A wider `failureThreshold` is the shock absorber: a short etcd blip no longer
+SIGKILLs apiserver/etcd, so it can't cascade.
+
+```bash
+ansible-playbook playbooks/harden-cp-probes.yml --ask-vault-pass
+```
+
+The play is **idempotent** and runs `serial: 1` with a per-node readiness gate, so
+etcd/apiserver quorum (2/3) stays intact — only one CP component restarts at a
+time. The same patch is baked into `k8s-upgrade.yml` because kubeadm regenerates
+the static-pod manifests (resetting the probes to `8`) on every upgrade.
 
 ## Docker Hub pull-through cache (containerd mirror)
 

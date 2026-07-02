@@ -1,0 +1,74 @@
+---
+# Harden control-plane liveness probes so a transient etcd disk-latency blip
+# cannot SIGKILL kube-apiserver/etcd and cascade into a cluster-wide
+# leader-election restart. Raises the liveness failureThreshold from 8 to 24;
+# with periodSeconds=10 this widens tolerance from ~80s to ~240s.
+#
+# Background: on 2026-06-19 a transient storage I/O stall spiked etcd WAL fsync
+# to ~1s. All three apiservers' /livez failed, kubelet SIGKILLed them, and every
+# --leader-elect controller in the cluster restarted (11 PodCrashLooping alerts).
+# A wider failureThreshold is the shock absorber: a brief etcd blip no longer
+# kills the control plane.
+#
+# Idempotent and safe to re-run. serial: 1 plus a per-node readiness gate keeps
+# etcd and apiserver quorum (2/3) intact throughout the rollout.
+#
+#   ansible-playbook playbooks/harden-cp-probes.yml
+#
+# The same patch is baked into k8s-upgrade.yml so it survives kubeadm upgrades
+# (kubeadm regenerates the static-pod manifests on every upgrade).
+
+- name: Harden control-plane liveness probes
+  hosts: control_plane
+  serial: 1
+  become: true
+  vars:
+    short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
+  tasks:
+    - name: Harden kube-apiserver liveness probe (failureThreshold 8 -> 24)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Harden etcd liveness probe (failureThreshold 8 -> 24)
+      replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Verify kube-apiserver liveness probe hardened
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify etcd liveness probe hardened
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/etcd.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for kubelet to apply manifest changes and restart static pods
+      pause:
+        seconds: 25
+
+    - name: Wait for kube-apiserver static pod on {{ short_name }} to be Ready
+      command: kubectl wait --for=condition=Ready pod/kube-apiserver-{{ short_name }} -n kube-system --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: false
+
+    - name: Wait for etcd static pod on {{ short_name }} to be Ready
+      command: kubectl wait --for=condition=Ready pod/etcd-{{ short_name }} -n kube-system --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: etcd_ready
+      until: etcd_ready.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: false

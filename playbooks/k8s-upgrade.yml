@@ -69,6 +69,30 @@
       command: grep -q -- '--bind-address=0.0.0.0' /etc/kubernetes/manifests/kube-scheduler.yaml
       changed_when: false
 
+    - name: Harden kube-apiserver liveness probe (kubeadm upgrade resets failureThreshold to 8)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Verify kube-apiserver liveness probe hardened to failureThreshold 24
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Harden etcd liveness probe (kubeadm upgrade resets failureThreshold to 8)
+      replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Verify etcd liveness probe hardened to failureThreshold 24
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/etcd.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Drain k8scp01
       command: kubectl drain k8scp01 --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
@@ -174,6 +198,30 @@
 
     - name: Verify kube-scheduler metrics rebound to 0.0.0.0
       command: grep -q -- '--bind-address=0.0.0.0' /etc/kubernetes/manifests/kube-scheduler.yaml
+      changed_when: false
+
+    - name: Harden kube-apiserver liveness probe (kubeadm upgrade resets failureThreshold to 8)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Verify kube-apiserver liveness probe hardened to failureThreshold 24
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Harden etcd liveness probe (kubeadm upgrade resets failureThreshold to 8)
+      replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '(livenessProbe:\n\s+)failureThreshold: 8$'
+        replace: '\g<1>failureThreshold: 24'
+
+    - name: Verify etcd liveness probe hardened to failureThreshold 24
+      shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/etcd.yaml | grep -q 'failureThreshold: 24'"
+      args:
+        executable: /bin/bash
       changed_when: false
 
     - name: Drain {{ short_name }}

@@ -9,7 +9,7 @@ inventory/
   hosts.ini                       # all managed hosts, grouped by role
 playbooks/
   k8s-upgrade.yml                 # Kubernetes minor-version upgrade, one hop at a time
-  harden-cp-probes.yml            # widen apiserver/etcd liveness probes (anti-cascade)
+  harden-cp-probes.yml            # widen apiserver/etcd probes + KCM/scheduler leader-election (anti-cascade)
   os-patch.yml                    # rolling apt full-upgrade + reboot-if-required (general OS patcher)
   cp-containerd-upgrade.yml       # control-plane containerd 1.7 -> 2.2 upgrade
   containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
@@ -63,7 +63,8 @@ Wait for each hop to complete before starting the next.
 1. Updates `/etc/apt/sources.list.d/kubernetes.list` to the new minor-version repo on every node
 2. Upgrades kubeadm, runs `kubeadm upgrade apply` on k8scp01, `kubeadm upgrade node` on the rest
 3. Re-applies CP static-pod customizations that kubeadm resets: rebinds etcd/controller-manager/scheduler
-   metrics to `0.0.0.0`, and re-hardens the apiserver/etcd liveness probes (see [probe hardening](#control-plane-probe-hardening))
+   metrics to `0.0.0.0`, and re-hardens the apiserver/etcd liveness probes + KCM/scheduler leader-election
+   timeouts (see [control-plane hardening](#control-plane-hardening))
 4. Drains each node, upgrades kubelet + kubectl, restarts kubelet, uncordons
 
 ### Before running
@@ -120,27 +121,48 @@ The gate after each node depends on the node's role:
 Run only when the cluster is healthy (all etcd members healthy, all Longhorn
 volumes healthy). The cluster stays available throughout.
 
-## Control-plane probe hardening
+## Control-plane hardening
 
-`harden-cp-probes.yml` widens the kube-apiserver and etcd **liveness** probes so a
-transient etcd disk-latency blip can't kill the control plane. It raises each
-liveness `failureThreshold` from `8` to `24`; with `periodSeconds=10` that widens
-tolerance from ~80s to ~240s.
+`harden-cp-probes.yml` applies two independent shock absorbers to the static-pod
+manifests so a transient etcd disk-latency blip can't cascade into a cluster-wide
+control-plane restart storm.
 
-**Why:** on 2026-06-19 a brief storage I/O stall spiked etcd WAL fsync to ~1s. All
+**1. Liveness probes (kube-apiserver + etcd).** Raises each liveness
+`failureThreshold` from `8` to `24`; with `periodSeconds=10` that widens tolerance
+from ~80s to ~240s, so a blip no longer lets kubelet SIGKILL apiserver/etcd.
+
+*Why:* on 2026-06-19 a brief storage I/O stall spiked etcd WAL fsync to ~1s. All
 three apiservers' `/livez` failed, the kubelet SIGKILLed them, and every
 `--leader-elect` controller in the cluster restarted (11 `PodCrashLooping` alerts).
-A wider `failureThreshold` is the shock absorber: a short etcd blip no longer
-SIGKILLs apiserver/etcd, so it can't cascade.
+
+**2. Leader-election timeouts (kube-controller-manager + kube-scheduler).** The
+kubeadm defaults run these controllers with a bare `--leader-elect=true`, which
+gives them only 10s to renew a lease (lease 15s / renew 10s / retry 2s). This play
+adds explicit flags doubling every window — lease `30s`, renew-deadline `20s`,
+retry-period `4s` — so a controller can ride out a multi-second etcd fsync spike
+without losing leadership and restarting.
+
+*Why:* on 2026-07-04 the nightly Velero `daily-full` backup (kopia FSB, one
+PodVolumeBackup per volume) spiked etcd WAL fsync from a ~14ms baseline to 54ms.
+That blew the 10s renew deadline and knocked four leader-elected controllers into
+simultaneous restarts. Probe widening addresses the SIGKILL mode; leader-election
+widening addresses the lease-loss mode.
+
+Both are shock absorbers — they tolerate a blip but don't remove it. The trigger
+itself (etcd sharing a physical ZFS pool with noisy neighbours) is removed by
+storage isolation onto per-host local NVMe; see the `etcd-local-nvme-migration`
+runbook in the k8s cluster repo.
 
 ```bash
 ansible-playbook playbooks/harden-cp-probes.yml --ask-vault-pass
 ```
 
-The play is **idempotent** and runs `serial: 1` with a per-node readiness gate, so
-etcd/apiserver quorum (2/3) stays intact — only one CP component restarts at a
-time. The same patch is baked into `k8s-upgrade.yml` because kubeadm regenerates
-the static-pod manifests (resetting the probes to `8`) on every upgrade.
+The play is **idempotent** and runs `serial: 1` with per-node readiness gates
+(apiserver, etcd, controller-manager, scheduler), so etcd/apiserver quorum (2/3)
+stays intact — only one CP node's components restart at a time. The same patches
+are baked into `k8s-upgrade.yml` because kubeadm regenerates the static-pod
+manifests (resetting the probes to `8` and dropping the leader-election flags) on
+every upgrade.
 
 ## Docker Hub pull-through cache (containerd mirror)
 

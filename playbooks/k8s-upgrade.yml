@@ -93,6 +93,34 @@
         executable: /bin/bash
       changed_when: false
 
+    - name: Widen kube-controller-manager leader-election timeouts (kubeadm upgrade resets to defaults)
+      replace:
+        path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-controller-manager leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-controller-manager.yaml
+      changed_when: false
+
+    - name: Widen kube-scheduler leader-election timeouts (kubeadm upgrade resets to defaults)
+      replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-scheduler leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-scheduler.yaml
+      changed_when: false
+
     - name: Drain k8scp01
       command: kubectl drain k8scp01 --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
@@ -222,6 +250,34 @@
       shell: "grep -A1 'livenessProbe:' /etc/kubernetes/manifests/etcd.yaml | grep -q 'failureThreshold: 24'"
       args:
         executable: /bin/bash
+      changed_when: false
+
+    - name: Widen kube-controller-manager leader-election timeouts (kubeadm upgrade resets to defaults)
+      replace:
+        path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-controller-manager leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-controller-manager.yaml
+      changed_when: false
+
+    - name: Widen kube-scheduler leader-election timeouts (kubeadm upgrade resets to defaults)
+      replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-scheduler leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-scheduler.yaml
       changed_when: false
 
     - name: Drain {{ short_name }}

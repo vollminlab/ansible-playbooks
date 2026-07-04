@@ -1,24 +1,35 @@
 ---
-# Harden control-plane liveness probes so a transient etcd disk-latency blip
-# cannot SIGKILL kube-apiserver/etcd and cascade into a cluster-wide
-# leader-election restart. Raises the liveness failureThreshold from 8 to 24;
-# with periodSeconds=10 this widens tolerance from ~80s to ~240s.
+# Harden the control plane against transient etcd disk-latency blips so a brief
+# storage stall cannot cascade into a cluster-wide control-plane restart storm.
+# Two independent shock absorbers, applied to the static-pod manifests:
 #
-# Background: on 2026-06-19 a transient storage I/O stall spiked etcd WAL fsync
-# to ~1s. All three apiservers' /livez failed, kubelet SIGKILLed them, and every
-# --leader-elect controller in the cluster restarted (11 PodCrashLooping alerts).
-# A wider failureThreshold is the shock absorber: a brief etcd blip no longer
-# kills the control plane.
+#   1. Liveness probes (kube-apiserver + etcd): failureThreshold 8 -> 24. With
+#      periodSeconds=10 this widens tolerance from ~80s to ~240s, so a blip no
+#      longer lets kubelet SIGKILL apiserver/etcd.
+#   2. Leader-election timeouts (kube-controller-manager + kube-scheduler):
+#      lease-duration 15s->30s, renew-deadline 10s->20s, retry-period 2s->4s.
+#      The kubeadm defaults give a controller only 10s to renew its lease; an
+#      etcd fsync spike past that mark makes it lose leadership and restart.
+#      Doubling the windows lets a controller ride out a multi-second blip.
 #
-# Idempotent and safe to re-run. serial: 1 plus a per-node readiness gate keeps
+# Background: on 2026-06-19 a storage I/O stall spiked etcd WAL fsync to ~1s;
+# all three apiservers' /livez failed and every --leader-elect controller
+# restarted (11 PodCrashLooping alerts). On 2026-07-04 the nightly Velero
+# daily-full backup spiked etcd fsync 14ms->54ms and knocked four controllers
+# into leader-election restarts. Probe widening addresses the first mode;
+# leader-election widening addresses the second. (Storage isolation onto local
+# NVMe -- see the k8s repo etcd-local-nvme-migration runbook -- removes the
+# trigger itself; this playbook tolerates any residual blip.)
+#
+# Idempotent and safe to re-run. serial: 1 plus per-node readiness gates keep
 # etcd and apiserver quorum (2/3) intact throughout the rollout.
 #
 #   ansible-playbook playbooks/harden-cp-probes.yml
 #
-# The same patch is baked into k8s-upgrade.yml so it survives kubeadm upgrades
-# (kubeadm regenerates the static-pod manifests on every upgrade).
+# The same patches are baked into k8s-upgrade.yml so they survive kubeadm
+# upgrades (kubeadm regenerates the static-pod manifests on every upgrade).
 
-- name: Harden control-plane liveness probes
+- name: Harden control plane against transient etcd latency
   hosts: control_plane
   serial: 1
   become: true
@@ -49,6 +60,34 @@
         executable: /bin/bash
       changed_when: false
 
+    - name: Widen kube-controller-manager leader-election timeouts (15/10/2 -> 30/20/4)
+      replace:
+        path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-controller-manager leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-controller-manager.yaml
+      changed_when: false
+
+    - name: Widen kube-scheduler leader-election timeouts (15/10/2 -> 30/20/4)
+      replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: '^(?P<indent>\s*)- --leader-elect=true$\n(?!(?P=indent)- --leader-elect-lease-duration)'
+        replace: |
+          \g<indent>- --leader-elect=true
+          \g<indent>- --leader-elect-lease-duration=30s
+          \g<indent>- --leader-elect-renew-deadline=20s
+          \g<indent>- --leader-elect-retry-period=4s
+
+    - name: Verify kube-scheduler leader-election timeouts present
+      command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-scheduler.yaml
+      changed_when: false
+
     - name: Wait for kubelet to apply manifest changes and restart static pods
       pause:
         seconds: 25
@@ -69,6 +108,26 @@
       become: false
       register: etcd_ready
       until: etcd_ready.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: false
+
+    - name: Wait for kube-controller-manager static pod on {{ short_name }} to be Ready
+      command: kubectl wait --for=condition=Ready pod/kube-controller-manager-{{ short_name }} -n kube-system --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: kcm_ready
+      until: kcm_ready.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: false
+
+    - name: Wait for kube-scheduler static pod on {{ short_name }} to be Ready
+      command: kubectl wait --for=condition=Ready pod/kube-scheduler-{{ short_name }} -n kube-system --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: sched_ready
+      until: sched_ready.rc == 0
       retries: 12
       delay: 15
       changed_when: false

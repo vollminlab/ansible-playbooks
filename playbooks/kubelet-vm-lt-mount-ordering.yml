@@ -1,0 +1,107 @@
+---
+# Couple kubelet's startup to the VictoriaMetrics cold-tier data mount on
+# k8sworker01, so kubelet can never start the vm-lt pod before /mnt/vm-lt is
+# actually mounted.
+#
+# Background: the cold tier (victoria-metrics-lt) stores ~13 months of metrics
+# on a 750G ext4 filesystem (/dev/sdX) mounted at /mnt/vm-lt on k8sworker01,
+# surfaced to Kubernetes as a static `local` PV. kubelet bind-mounts local.path
+# (/mnt/vm-lt) into the pod. THE TRAP: if the ext4 filesystem is not mounted at
+# /mnt/vm-lt when kubelet sets up the volume, kubelet silently binds the empty
+# underlying directory on the root LV instead -- no error, no event. On
+# 2026-07-08 exactly this happened (the disk was hot-added but never `mount -a`d
+# and fstab carried `nofail`), so VM wrote cold-tier data to the OS root disk
+# until it was caught and remounted. At 1.63 GB/day that would eventually fill
+# k8sworker01's root and take the node NotReady.
+#
+# The fix: a kubelet.service drop-in adding `RequiresMountsFor=/mnt/vm-lt`.
+# systemd translates this into a Requires= + After= on the mnt-vm\x2dlt.mount
+# unit, so kubelet refuses to start until the filesystem is mounted -- turning
+# the silent wrong-target bind into a hard, visible ordering dependency. The
+# fstab `nofail` (which keeps a missing disk from blocking boot) is unaffected;
+# only kubelet gains the dependency.
+#
+# Scope: k8sworker01 ONLY. No other node has /mnt/vm-lt, so a cluster-wide
+# RequiresMountsFor would prevent kubelet from ever starting on them. The disk
+# is a local block device to the guest (the pool_0 NFS backing is ESXi-side
+# only), so coupling kubelet to it carries no cross-node risk.
+#
+# Safety: this playbook REFUSES to install the drop-in unless /mnt/vm-lt is
+# currently a real mountpoint AND has an /etc/fstab entry -- otherwise the
+# ordering dependency could wedge kubelet at the next reboot with no mount unit
+# to satisfy it. It runs `daemon-reload` only; kubelet is NOT restarted, so the
+# change is non-disruptive and takes effect on the next kubelet start / reboot.
+#
+# Idempotent and safe to re-run.
+#
+#   ansible-playbook playbooks/kubelet-vm-lt-mount-ordering.yml --ask-vault-pass
+
+- name: Order kubelet after the vm-lt cold-tier mount (k8sworker01 only)
+  hosts: k8sworker01.vollminlab.com
+  become: true
+  vars:
+    vm_lt_mount: /mnt/vm-lt
+    dropin_dir: /etc/systemd/system/kubelet.service.d
+    dropin_file: /etc/systemd/system/kubelet.service.d/20-vm-lt-mount.conf
+  tasks:
+    - name: Safety — assert /mnt/vm-lt is currently a real mountpoint
+      command: mountpoint -q {{ vm_lt_mount }}
+      changed_when: false
+      register: vm_lt_mounted
+      failed_when: vm_lt_mounted.rc != 0
+      # If this fails, DO NOT proceed: adding RequiresMountsFor against a path
+      # that is not actually mounted would wedge kubelet. Mount it first.
+
+    - name: Safety — assert /mnt/vm-lt has an /etc/fstab entry
+      command: grep -qE '^\s*[^#].*\s{{ vm_lt_mount }}\s' /etc/fstab
+      changed_when: false
+      # RequiresMountsFor needs systemd to generate a .mount unit at boot, which
+      # it does from fstab. Without a persistent fstab entry the mount would not
+      # come back after reboot and kubelet would refuse to start.
+
+    - name: Compute the systemd mount unit name for {{ vm_lt_mount }}
+      command: systemd-escape --path --suffix=mount {{ vm_lt_mount }}
+      changed_when: false
+      register: vm_lt_mount_unit
+
+    - name: Ensure kubelet.service drop-in directory exists
+      file:
+        path: "{{ dropin_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install kubelet RequiresMountsFor drop-in
+      copy:
+        dest: "{{ dropin_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by ansible-playbooks/playbooks/kubelet-vm-lt-mount-ordering.yml
+          # Refuse to start kubelet until the VictoriaMetrics cold-tier filesystem
+          # is mounted, so the vm-lt local PV can never bind the empty root dir.
+          [Unit]
+          RequiresMountsFor={{ vm_lt_mount }}
+      register: dropin
+
+    - name: Reload systemd so the drop-in takes effect (no kubelet restart)
+      systemd:
+        daemon_reload: true
+
+    - name: Verify systemd loaded the drop-in
+      command: systemctl show kubelet.service -p DropInPaths
+      changed_when: false
+      register: kubelet_dropins
+      failed_when: dropin_file not in kubelet_dropins.stdout
+
+    - name: Verify kubelet is now ordered After the mount unit
+      command: systemctl show kubelet.service -p After
+      changed_when: false
+      register: kubelet_after
+      failed_when: vm_lt_mount_unit.stdout not in kubelet_after.stdout
+
+    - name: Verify kubelet is still active (daemon-reload is non-disruptive)
+      command: systemctl is-active kubelet.service
+      changed_when: false

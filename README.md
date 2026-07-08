@@ -13,6 +13,7 @@ playbooks/
   os-patch.yml                    # rolling apt full-upgrade + reboot-if-required (general OS patcher)
   cp-containerd-upgrade.yml       # control-plane containerd 1.7 -> 2.2 upgrade
   containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
+  kubelet-vm-lt-mount-ordering.yml # k8sworker01: order kubelet after the /mnt/vm-lt cold-tier mount
 ansible.cfg                       # default inventory, SSH key, connection settings
 ```
 
@@ -196,6 +197,31 @@ What it does, per node (`serial: 1`):
 
 Idempotent: re-running is a no-op once applied. New nodes should run this
 playbook before joining production workloads.
+
+## kubelet vm-lt mount ordering (k8sworker01)
+
+`kubelet-vm-lt-mount-ordering.yml` installs a kubelet.service drop-in on
+**k8sworker01 only** that adds `RequiresMountsFor=/mnt/vm-lt`, so kubelet
+refuses to start until the VictoriaMetrics cold-tier filesystem is mounted.
+
+Why: the cold tier (`victoria-metrics-lt`) stores ~13 months of metrics on a
+750G ext4 filesystem at `/mnt/vm-lt`, surfaced as a static `local` PV. kubelet
+bind-mounts `/mnt/vm-lt` into the pod — but if the filesystem is not mounted
+when kubelet sets up the volume, kubelet silently binds the empty underlying
+directory on the root LV instead, with no error. On 2026-07-08 that happened
+(disk hot-added but never `mount -a`d, fstab carried `nofail`) and VM wrote
+cold-tier data to the OS root disk until it was caught. The drop-in turns that
+silent wrong-target bind into a hard systemd ordering dependency.
+
+Scoped to k8sworker01 because no other node has `/mnt/vm-lt`; a cluster-wide
+`RequiresMountsFor` would stop kubelet from starting elsewhere. The playbook
+refuses to install unless `/mnt/vm-lt` is currently mounted **and** present in
+`/etc/fstab`, and runs `daemon-reload` only (no kubelet restart) — the ordering
+takes effect on the next kubelet start / reboot.
+
+```bash
+ansible-playbook playbooks/kubelet-vm-lt-mount-ordering.yml --ask-vault-pass
+```
 
 ## Control-plane containerd upgrade
 

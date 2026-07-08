@@ -59,11 +59,6 @@
       # it does from fstab. Without a persistent fstab entry the mount would not
       # come back after reboot and kubelet would refuse to start.
 
-    - name: Compute the systemd mount unit name for {{ vm_lt_mount }}
-      command: systemd-escape --path --suffix=mount {{ vm_lt_mount }}
-      changed_when: false
-      register: vm_lt_mount_unit
-
     - name: Ensure kubelet.service drop-in directory exists
       file:
         path: "{{ dropin_dir }}"
@@ -96,11 +91,14 @@
       register: kubelet_dropins
       failed_when: dropin_file not in kubelet_dropins.stdout
 
-    - name: Verify kubelet is now ordered After the mount unit
-      command: systemctl show kubelet.service -p After
+    - name: Verify kubelet is now ordered after the vm-lt mount unit
+      command: systemctl show kubelet.service -p After --value
       changed_when: false
       register: kubelet_after
-      failed_when: vm_lt_mount_unit.stdout not in kubelet_after.stdout
+      # systemctl C-escapes the unit name to mnt-vm\x2dlt.mount and quotes it,
+      # which does NOT match systemd-escape's single-backslash form. Match the
+      # escaping-invariant fragment instead of comparing exact strings.
+      failed_when: not (kubelet_after.stdout is search('x2dlt.mount'))
 
     - name: Verify kubelet is still active (daemon-reload is non-disruptive)
       command: systemctl is-active kubelet.service

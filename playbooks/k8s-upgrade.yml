@@ -121,6 +121,40 @@
       command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-scheduler.yaml
       changed_when: false
 
+    - name: Set GOMEMLIMIT on kube-apiserver (kubeadm upgrade drops the env block)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]{4,})name: kube-apiserver\n(?:(?P=indent)env:\n(?P=indent)- name: GOMEMLIMIT\n(?P=indent)  value: [^\n]*\n)?'
+        replace: |
+          \g<indent>name: kube-apiserver
+          \g<indent>env:
+          \g<indent>- name: GOMEMLIMIT
+          \g<indent>  value: "{{ apiserver_gomemlimit }}"
+
+    - name: Verify GOMEMLIMIT present in kube-apiserver manifest
+      shell: "grep -A1 'name: GOMEMLIMIT' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q '{{ apiserver_gomemlimit }}'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Set kube-apiserver memory request/limit (kubeadm upgrade resets resources to cpu-only)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]*)resources:\n(?P=indent)  requests:\n(?P=indent)    cpu: (?P<cpu>[^\n]+)\n(?:(?P=indent)    memory: [^\n]*\n)?(?:(?P=indent)  limits:\n(?P=indent)    memory: [^\n]*\n)?'
+        replace: |
+          \g<indent>resources:
+          \g<indent>  requests:
+          \g<indent>    cpu: \g<cpu>
+          \g<indent>    memory: {{ apiserver_memory_request }}
+          \g<indent>  limits:
+          \g<indent>    memory: {{ apiserver_memory_limit }}
+
+    - name: Verify kube-apiserver memory limit present in manifest
+      shell: "grep -A2 'limits:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'memory: {{ apiserver_memory_limit }}'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
     - name: Drain k8scp01
       command: kubectl drain k8scp01 --ignore-daemonsets --delete-emptydir-data --force --disable-eviction
       delegate_to: localhost
@@ -278,6 +312,40 @@
 
     - name: Verify kube-scheduler leader-election timeouts present
       command: grep -q -- '--leader-elect-renew-deadline=20s' /etc/kubernetes/manifests/kube-scheduler.yaml
+      changed_when: false
+
+    - name: Set GOMEMLIMIT on kube-apiserver (kubeadm upgrade drops the env block)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]{4,})name: kube-apiserver\n(?:(?P=indent)env:\n(?P=indent)- name: GOMEMLIMIT\n(?P=indent)  value: [^\n]*\n)?'
+        replace: |
+          \g<indent>name: kube-apiserver
+          \g<indent>env:
+          \g<indent>- name: GOMEMLIMIT
+          \g<indent>  value: "{{ apiserver_gomemlimit }}"
+
+    - name: Verify GOMEMLIMIT present in kube-apiserver manifest
+      shell: "grep -A1 'name: GOMEMLIMIT' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q '{{ apiserver_gomemlimit }}'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Set kube-apiserver memory request/limit (kubeadm upgrade resets resources to cpu-only)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]*)resources:\n(?P=indent)  requests:\n(?P=indent)    cpu: (?P<cpu>[^\n]+)\n(?:(?P=indent)    memory: [^\n]*\n)?(?:(?P=indent)  limits:\n(?P=indent)    memory: [^\n]*\n)?'
+        replace: |
+          \g<indent>resources:
+          \g<indent>  requests:
+          \g<indent>    cpu: \g<cpu>
+          \g<indent>    memory: {{ apiserver_memory_request }}
+          \g<indent>  limits:
+          \g<indent>    memory: {{ apiserver_memory_limit }}
+
+    - name: Verify kube-apiserver memory limit present in manifest
+      shell: "grep -A2 'limits:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'memory: {{ apiserver_memory_limit }}'"
+      args:
+        executable: /bin/bash
       changed_when: false
 
     - name: Drain {{ short_name }}

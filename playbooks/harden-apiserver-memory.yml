@@ -1,0 +1,102 @@
+---
+# Bound kube-apiserver memory on every control-plane node.
+#
+# Why: on 2026-07-24 the kube-apiserver on k8scp02 reached ~5.9 GB working set on
+# an 8 GB VM. MemAvailable fell to ~2 GB, the kernel evicted the page cache down
+# to 750 MB, and the node entered an 11.5-minute refault storm (memory PSI 46.5%,
+# 23.2M major faults, 3.7 GB/s sustained disk reads confirmed at the hypervisor).
+# Every scrape target on the node went down, etcd lost leadership to k8scp01, and
+# the Calico dataplane loop hit 8.4 s. It ended only when the kernel OOM-killed
+# the apiserver (exit 137 at 14:41:51).
+#
+# This is not a leak. Go memstats at the time showed heap_alloc 1.70-2.06 GiB
+# against a next_gc of ~3.1 GiB - textbook GOGC=100 - with ~2.0 GiB already
+# returned to the OS. The live heap simply drifts up with uptime (0.91 GiB on a
+# freshly restarted apiserver vs 3.6-3.8 GB RSS after 19 days), which raises the
+# GC target; a burst of LIST traffic then doubles toward it. Drift gets the node
+# to the edge, a burst pushes it over.
+#
+# The enabler is that kubeadm gives the apiserver container no memory bound at
+# all - `resources: {requests: {cpu: 250m}}` and no env - so the *node* dies
+# instead of the container. This play adds both halves:
+#
+#   1. GOMEMLIMIT - a soft limit. The Go runtime GCs harder as it approaches it
+#      and never OOMs on account of it, so it trades CPU for a bounded heap. This
+#      is the modern replacement for --target-ram-mb, which no longer exists.
+#   2. A memory request + hard limit - the backstop for what GOMEMLIMIT cannot
+#      cover. Losing one apiserver of three to an OOMKill costs seconds; a
+#      node-wide refault storm costs minutes and takes etcd with it.
+#
+# Values live in inventory/group_vars/control_plane.yml. The same two patches are
+# baked into k8s-upgrade.yml so they survive kubeadm upgrades (kubeadm regenerates
+# the static-pod manifests on every upgrade).
+#
+# Idempotent and convergent: re-running with changed values rewrites them in
+# place rather than appending.
+#
+#   ansible-playbook playbooks/harden-apiserver-memory.yml --ask-vault-pass
+
+- name: Bound kube-apiserver memory on the control plane
+  hosts: control_plane
+  serial: 1
+  become: true
+  vars:
+    short_name: "{{ inventory_hostname | regex_replace('\\.vollminlab\\.com$', '') }}"
+  tasks:
+    - name: Set GOMEMLIMIT on kube-apiserver ({{ apiserver_gomemlimit }} soft heap ceiling)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]{4,})name: kube-apiserver\n(?:(?P=indent)env:\n(?P=indent)- name: GOMEMLIMIT\n(?P=indent)  value: [^\n]*\n)?'
+        replace: |
+          \g<indent>name: kube-apiserver
+          \g<indent>env:
+          \g<indent>- name: GOMEMLIMIT
+          \g<indent>  value: "{{ apiserver_gomemlimit }}"
+
+    - name: Verify GOMEMLIMIT present in kube-apiserver manifest
+      shell: "grep -A1 'name: GOMEMLIMIT' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q '{{ apiserver_gomemlimit }}'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Set kube-apiserver memory request/limit ({{ apiserver_memory_request }} / {{ apiserver_memory_limit }})
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '^(?P<indent>[ ]*)resources:\n(?P=indent)  requests:\n(?P=indent)    cpu: (?P<cpu>[^\n]+)\n(?:(?P=indent)    memory: [^\n]*\n)?(?:(?P=indent)  limits:\n(?P=indent)    memory: [^\n]*\n)?'
+        replace: |
+          \g<indent>resources:
+          \g<indent>  requests:
+          \g<indent>    cpu: \g<cpu>
+          \g<indent>    memory: {{ apiserver_memory_request }}
+          \g<indent>  limits:
+          \g<indent>    memory: {{ apiserver_memory_limit }}
+
+    - name: Verify kube-apiserver memory limit present in manifest
+      shell: "grep -A2 'limits:' /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q 'memory: {{ apiserver_memory_limit }}'"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for kubelet to apply manifest changes and restart the static pod
+      pause:
+        seconds: 25
+
+    - name: Wait for kube-apiserver static pod on {{ short_name }} to be Ready
+      command: kubectl wait --for=condition=Ready pod/kube-apiserver-{{ short_name }} -n kube-system --timeout=30s
+      delegate_to: localhost
+      become: false
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: false
+
+    - name: Confirm the running kube-apiserver on {{ short_name }} carries both bounds
+      command: >-
+        kubectl get pod kube-apiserver-{{ short_name }} -n kube-system
+        -o jsonpath={.spec.containers[0].env[?(@.name=="GOMEMLIMIT")].value}|{.spec.containers[0].resources.limits.memory}
+      delegate_to: localhost
+      become: false
+      register: live_bounds
+      changed_when: false
+      failed_when: live_bounds.stdout != apiserver_gomemlimit ~ '|' ~ apiserver_memory_limit

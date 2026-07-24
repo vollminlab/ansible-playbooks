@@ -1,0 +1,21 @@
+---
+# kube-apiserver memory bounds, applied to the static-pod manifest on every CP node.
+#
+# Consumed by BOTH playbooks/harden-apiserver-memory.yml (applies them) and
+# playbooks/k8s-upgrade.yml (re-applies them after kubeadm regenerates the
+# manifest). Change the values here only — never in the playbooks.
+#
+# Sizing rationale (CP nodes are 4 vCPU / 8 GB):
+#   - steady-state apiserver RSS is 3.6-3.8 GB after ~3 weeks uptime, with a
+#     live heap of ~1.7-2.1 GiB and a GC target (next_gc) of ~3.1 GiB
+#   - GOMEMLIMIT sits above that steady state, so there is no GC thrash, but
+#     below the ~5.9 GB peak that starved the node of page cache on 2026-07-24
+#   - the hard limit is the backstop for the cases GOMEMLIMIT cannot cover
+#     (fragmentation, non-Go allocations): one apiserver OOMKill out of three is
+#     recoverable in seconds, a node-wide refault storm is not
+#
+# If the CP VMs are ever resized (8 -> 16 GB), raise all three here and re-run
+# playbooks/harden-apiserver-memory.yml.
+apiserver_gomemlimit: "4GiB"
+apiserver_memory_request: "2Gi"
+apiserver_memory_limit: "5Gi"

@@ -7,9 +7,11 @@ Ansible automation for the Vollminlab homelab. Runs from `ansible01.vollminlab.c
 ```
 inventory/
   hosts.ini                       # all managed hosts, grouped by role
+  group_vars/control_plane.yml    # kube-apiserver memory bounds (GOMEMLIMIT, request, limit)
 playbooks/
   k8s-upgrade.yml                 # Kubernetes minor-version upgrade, one hop at a time
   harden-cp-probes.yml            # widen apiserver/etcd probes + KCM/scheduler leader-election (anti-cascade)
+  harden-apiserver-memory.yml     # bound kube-apiserver memory (GOMEMLIMIT + request/limit)
   os-patch.yml                    # rolling apt full-upgrade + reboot-if-required (general OS patcher)
   cp-containerd-upgrade.yml       # control-plane containerd 1.7 -> 2.2 upgrade
   containerd-dockerhub-mirror.yml # route docker.io through the Harbor pull-through cache
@@ -64,8 +66,9 @@ Wait for each hop to complete before starting the next.
 1. Updates `/etc/apt/sources.list.d/kubernetes.list` to the new minor-version repo on every node
 2. Upgrades kubeadm, runs `kubeadm upgrade apply` on k8scp01, `kubeadm upgrade node` on the rest
 3. Re-applies CP static-pod customizations that kubeadm resets: rebinds etcd/controller-manager/scheduler
-   metrics to `0.0.0.0`, and re-hardens the apiserver/etcd liveness probes + KCM/scheduler leader-election
-   timeouts (see [control-plane hardening](#control-plane-hardening))
+   metrics to `0.0.0.0`, re-hardens the apiserver/etcd liveness probes + KCM/scheduler leader-election
+   timeouts (see [control-plane hardening](#control-plane-hardening)), and re-applies the apiserver
+   memory bounds (see [kube-apiserver memory bounds](#kube-apiserver-memory-bounds))
 4. Drains each node, upgrades kubelet + kubectl, restarts kubelet, uncordons
 
 ### Before running
@@ -163,6 +166,59 @@ The play is **idempotent** and runs `serial: 1` with per-node readiness gates
 stays intact — only one CP node's components restart at a time. The same patches
 are baked into `k8s-upgrade.yml` because kubeadm regenerates the static-pod
 manifests (resetting the probes to `8` and dropping the leader-election flags) on
+every upgrade.
+
+## kube-apiserver memory bounds
+
+`harden-apiserver-memory.yml` gives the kube-apiserver container a memory ceiling
+it does not have out of the box. kubeadm writes `resources: {requests: {cpu:
+250m}}` and no env, so nothing bounds apiserver memory — when it grows, the
+**node** runs out, not the container.
+
+**1. `GOMEMLIMIT` (soft).** The Go runtime GCs harder as it approaches the limit
+and never OOMs on account of it, trading CPU for a bounded heap. This is the
+modern replacement for `--target-ram-mb`, which no longer exists in Kubernetes.
+
+**2. Memory request + hard limit.** The backstop for what `GOMEMLIMIT` cannot
+cover (fragmentation, non-Go allocations). Losing one apiserver of three to an
+OOMKill costs seconds; a node-wide refault storm costs minutes and takes etcd
+with it.
+
+*Why:* on 2026-07-24 the apiserver on k8scp02 reached ~5.9 GB working set on an
+8 GB VM. MemAvailable fell to ~2 GB, the kernel evicted the page cache to 750 MB,
+and the node spent 11.5 minutes in a refault storm — memory PSI 46.5%, 23.2M
+major faults, 3.7 GB/s sustained disk reads (confirmed at the hypervisor, so the
+disk was fast, it was being asked for 3.7 GB/s). Every scrape target on the node
+went down, etcd lost leadership to k8scp01, and the Calico dataplane loop hit
+8.4 s. It ended only when the kernel OOM-killed the apiserver.
+
+It is not a leak: `heap_alloc` was 1.70–2.06 GiB against a `next_gc` of ~3.1 GiB
+(textbook `GOGC=100`), with ~2.0 GiB already returned to the OS. The live heap
+drifts up with uptime — 0.91 GiB on a freshly restarted apiserver vs 3.6–3.8 GB
+RSS after 19 days — which raises the GC target; a burst of LIST traffic then
+doubles toward it. Drift gets the node to the edge, a burst pushes it over.
+
+Values live in `inventory/group_vars/control_plane.yml` and are consumed by both
+this playbook and `k8s-upgrade.yml` — change them there, never in a playbook:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `apiserver_gomemlimit` | `4GiB` | soft heap ceiling — above steady state (3.6–3.8 GB) so no GC thrash, below the 5.9 GB peak |
+| `apiserver_memory_request` | `2Gi` | scheduling floor, roughly the live working set |
+| `apiserver_memory_limit` | `5Gi` | hard backstop, ~25% above `GOMEMLIMIT` |
+
+If the CP VMs are ever resized (8 → 16 GB), raise all three and re-run.
+
+```bash
+ansible-playbook playbooks/harden-apiserver-memory.yml --ask-vault-pass
+```
+
+The play is **idempotent and convergent** — re-running with changed values
+rewrites them in place rather than appending. It runs `serial: 1` with a
+per-node apiserver readiness gate plus a final check that the *running* pod
+carries both bounds, so etcd/apiserver quorum (2/3) stays intact. Editing the
+manifest restarts that node's apiserver container. The same two patches are baked
+into `k8s-upgrade.yml` because kubeadm regenerates the static-pod manifests on
 every upgrade.
 
 ## Docker Hub pull-through cache (containerd mirror)

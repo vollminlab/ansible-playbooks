@@ -99,4 +99,7 @@
       become: false
       register: live_bounds
       changed_when: false
-      failed_when: live_bounds.stdout != apiserver_gomemlimit ~ '|' ~ apiserver_memory_limit
+      failed_when: false
+      until: live_bounds.stdout == apiserver_gomemlimit ~ '|' ~ apiserver_memory_limit
+      retries: 18
+      delay: 10

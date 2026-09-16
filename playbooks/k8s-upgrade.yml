@@ -160,18 +160,28 @@
       delegate_to: localhost
       become: false
 
-    - name: Unhold kubelet and kubectl
-      command: apt-mark unhold kubelet kubectl
+    - name: Unhold kubelet, kubectl and cri-tools
+      command: apt-mark unhold kubelet kubectl cri-tools
 
-    - name: Install kubelet and kubectl {{ target_version }}
+    # cri-tools ships crictl, which THIS repo depends on: cp-containerd-upgrade.yml
+    # gates its "wait for containerd to come back" on `crictl info` and verifies the
+    # Harbor pull-through with `crictl pull`, and containerd-dockerhub-mirror.yml does
+    # the same across all 9 nodes. Neither installs it. On 2026-09-16 it was missing on
+    # k8scp02 and k8scp03 (present on k8scp01 and every worker), so those playbooks
+    # would have failed on the 2nd control plane — after restarting its containerd,
+    # which is the worst place to stop. It is pinned and held like kubelet/kubectl
+    # because os-patch.yml runs `apt full-upgrade` and would otherwise drift it out of
+    # step with the cluster version.
+    - name: Install kubelet, kubectl and cri-tools {{ target_version }}
       apt:
         name:
           - "kubelet={{ target_version }}-*"
           - "kubectl={{ target_version }}-*"
+          - "cri-tools={{ target_version }}-*"
         state: present
 
-    - name: Hold kubelet and kubectl
-      command: apt-mark hold kubelet kubectl
+    - name: Hold kubelet, kubectl and cri-tools
+      command: apt-mark hold kubelet kubectl cri-tools
 
     - name: Restart kubelet
       systemd:
@@ -353,18 +363,28 @@
       delegate_to: localhost
       become: false
 
-    - name: Unhold kubelet and kubectl
-      command: apt-mark unhold kubelet kubectl
+    - name: Unhold kubelet, kubectl and cri-tools
+      command: apt-mark unhold kubelet kubectl cri-tools
 
-    - name: Install kubelet and kubectl {{ target_version }}
+    # cri-tools ships crictl, which THIS repo depends on: cp-containerd-upgrade.yml
+    # gates its "wait for containerd to come back" on `crictl info` and verifies the
+    # Harbor pull-through with `crictl pull`, and containerd-dockerhub-mirror.yml does
+    # the same across all 9 nodes. Neither installs it. On 2026-09-16 it was missing on
+    # k8scp02 and k8scp03 (present on k8scp01 and every worker), so those playbooks
+    # would have failed on the 2nd control plane — after restarting its containerd,
+    # which is the worst place to stop. It is pinned and held like kubelet/kubectl
+    # because os-patch.yml runs `apt full-upgrade` and would otherwise drift it out of
+    # step with the cluster version.
+    - name: Install kubelet, kubectl and cri-tools {{ target_version }}
       apt:
         name:
           - "kubelet={{ target_version }}-*"
           - "kubectl={{ target_version }}-*"
+          - "cri-tools={{ target_version }}-*"
         state: present
 
-    - name: Hold kubelet and kubectl
-      command: apt-mark hold kubelet kubectl
+    - name: Hold kubelet, kubectl and cri-tools
+      command: apt-mark hold kubelet kubectl cri-tools
 
     - name: Restart kubelet
       systemd:
@@ -453,18 +473,28 @@
       delegate_to: localhost
       become: false
 
-    - name: Unhold kubelet and kubectl
-      command: apt-mark unhold kubelet kubectl
+    - name: Unhold kubelet, kubectl and cri-tools
+      command: apt-mark unhold kubelet kubectl cri-tools
 
-    - name: Install kubelet and kubectl {{ target_version }}
+    # cri-tools ships crictl, which THIS repo depends on: cp-containerd-upgrade.yml
+    # gates its "wait for containerd to come back" on `crictl info` and verifies the
+    # Harbor pull-through with `crictl pull`, and containerd-dockerhub-mirror.yml does
+    # the same across all 9 nodes. Neither installs it. On 2026-09-16 it was missing on
+    # k8scp02 and k8scp03 (present on k8scp01 and every worker), so those playbooks
+    # would have failed on the 2nd control plane — after restarting its containerd,
+    # which is the worst place to stop. It is pinned and held like kubelet/kubectl
+    # because os-patch.yml runs `apt full-upgrade` and would otherwise drift it out of
+    # step with the cluster version.
+    - name: Install kubelet, kubectl and cri-tools {{ target_version }}
       apt:
         name:
           - "kubelet={{ target_version }}-*"
           - "kubectl={{ target_version }}-*"
+          - "cri-tools={{ target_version }}-*"
         state: present
 
-    - name: Hold kubelet and kubectl
-      command: apt-mark hold kubelet kubectl
+    - name: Hold kubelet, kubectl and cri-tools
+      command: apt-mark hold kubelet kubectl cri-tools
 
     - name: Restart kubelet
       systemd:

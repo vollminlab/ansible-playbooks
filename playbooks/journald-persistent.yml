@@ -1,0 +1,145 @@
+---
+# Persist the systemd journal across reboots on every Kubernetes node.
+#
+# Background: journald's shipped default is `Storage=auto`, which means
+# "persistent IF /var/log/journal already exists, otherwise volatile". On these
+# nodes that directory did not exist, so the entire journal lived in
+# /run/log/journal -- a tmpfs. Every reboot erased it. `journalctl --list-boots`
+# on k8sworker06 listed exactly one boot, going back to 2026-08-08.
+#
+# Why that matters: the shutdown sequence is the single most valuable thing in
+# the journal and the only one guaranteed to be destroyed by the volatile
+# default. A node that reboots unexpectedly, hangs on unmount, gets
+# force-powered-off by the UPS orchestrator, or fails to honour kubelet's
+# Graceful Node Shutdown leaves its explanation in exactly the window that does
+# not survive. This was found on 2026-09-20 while proving kubelet Graceful Node
+# Shutdown (k8s-vollminlab-cluster#1269): the reboot would have produced no
+# readable evidence at all, and the test would have had to be repeated.
+#
+# THE TRAP: `systemctl restart systemd-journald` is NOT enough. With
+# Storage=persistent set and /var/log/journal created, journald keeps writing to
+# /run/log/journal until it is explicitly told to migrate. `journalctl --header`
+# still names /run paths and the directory stays empty, while
+# `systemd-analyze cat-config systemd/journald.conf` reports Storage=persistent
+# -- configured, reported, and not actually in effect. `journalctl --flush`
+# performs the migration. This playbook does both and then verifies the active
+# journal file is under /var/log/journal, rather than trusting the config.
+#
+# Sizing: capped rather than left to the default 10%-of-filesystem, because
+# these nodes have a history of disk-space incidents (k8sworker06 hit a disk
+# alert on 2026-09-16 from containerd image bloat). 200M is far more than a
+# shutdown sequence needs and is bounded regardless of how /var grows.
+#
+# Non-disruptive: journald restart does not affect workloads, kubelet or
+# containerd. No node is cordoned, drained or rebooted.
+#
+# Idempotent and safe to re-run. k8sworker06 was already configured by hand on
+# 2026-09-20 and this playbook converges it without change.
+#
+#   ansible-playbook playbooks/journald-persistent.yml --ask-vault-pass
+
+- name: Make the systemd journal persistent across reboots
+  hosts: k8s
+  become: true
+  serial: 1
+  vars:
+    journal_dir: /var/log/journal
+    dropin_dir: /etc/systemd/journald.conf.d
+    dropin_file: /etc/systemd/journald.conf.d/10-persistent.conf
+    max_use: 200M
+    max_file_size: 50M
+    min_free_mb: 2048
+  tasks:
+    - name: Safety — measure free space on the filesystem holding /var/log
+      command: df -BM --output=avail /var/log
+      changed_when: false
+      register: var_avail
+
+    - name: Safety — refuse to enable a persistent journal without headroom
+      assert:
+        that: var_avail.stdout_lines[1] | trim | regex_replace('M$', '') | int > min_free_mb
+        fail_msg: >-
+          Less than {{ min_free_mb }}M free on the filesystem holding /var/log.
+          Enabling a persistent journal here would add to an existing space
+          problem. Reclaim space first (check /var/lib/containerd).
+      # A capped journal cannot itself fill the disk, but a node already short
+      # on space should be fixed before anything new is asked of it.
+
+    - name: Ensure the journald drop-in directory exists
+      file:
+        path: "{{ dropin_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the persistent-journal drop-in
+      copy:
+        dest: "{{ dropin_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by ansible-playbooks/playbooks/journald-persistent.yml
+          # Keep the journal across reboots so a shutdown sequence can be read
+          # back with `journalctl -b -1`. Capped deliberately -- see the
+          # playbook header for why this is not left at the 10% default.
+          [Journal]
+          Storage=persistent
+          SystemMaxUse={{ max_use }}
+          SystemMaxFileSize={{ max_file_size }}
+      register: dropin
+
+    - name: Create the persistent journal directory
+      file:
+        path: "{{ journal_dir }}"
+        state: directory
+        owner: root
+        group: systemd-journal
+        mode: "2755"
+      register: journal_dir_created
+
+    - name: Apply journald's own tmpfiles rules to the journal directory
+      command: systemd-tmpfiles --create --prefix {{ journal_dir }}
+      when: journal_dir_created.changed
+      changed_when: journal_dir_created.changed
+      # Sets the ACLs journald expects (group systemd-journal, plus read ACLs
+      # for adm/wheel) rather than relying on the mode above alone.
+
+    - name: Restart journald to pick up the drop-in
+      systemd:
+        name: systemd-journald
+        state: restarted
+      when: dropin.changed or journal_dir_created.changed
+
+    - name: Flush the journal from /run to /var/log/journal
+      command: journalctl --flush
+      when: dropin.changed or journal_dir_created.changed
+      changed_when: true
+      # THE STEP THAT IS EASY TO MISS. Without this, journald keeps writing to
+      # the tmpfs and the whole change is inert while reporting success.
+
+    - name: Verify the effective config really says persistent
+      command: systemd-analyze cat-config systemd/journald.conf
+      changed_when: false
+      register: journald_config
+      failed_when: journald_config.stdout is not search('(?m)^Storage=persistent')
+
+    - name: Verify the ACTIVE journal file is under /var/log/journal
+      shell: journalctl --header | grep '^File path:' | head -1
+      changed_when: false
+      register: journal_header
+      failed_when: journal_dir not in journal_header.stdout
+      # This, not the config, is the proof. A node still writing to
+      # /run/log/journal fails here even though the config above passed.
+
+    - name: Report the journal's current size
+      command: du -sh {{ journal_dir }}
+      changed_when: false
+      register: journal_size
+
+    - name: Show the result
+      debug:
+        msg: >-
+          {{ inventory_hostname }}: journal persistent at {{ journal_dir }}
+          ({{ journal_size.stdout.split()[0] }}, capped at {{ max_use }})

@@ -64,6 +64,7 @@ playbooks/
   cp-containerd-upgrade.yml          # control-plane containerd 1.7.27 -> 2.2.4
   containerd-dockerhub-mirror.yml    # route docker.io through the Harbor pull-through cache
   kubelet-vm-lt-mount-ordering.yml   # k8sworker01: order kubelet after the /mnt/vm-lt mount
+  journald-persistent.yml            # keep the journal across reboots so shutdowns can be read back
 ```
 
 There are no roles, no `group_vars`, and no `requirements.yml`. Every module used — `apt`, `command`,
@@ -80,6 +81,7 @@ There are no roles, no `group_vars`, and no `requirements.yml`. Every module use
 | `containerd-dockerhub-mirror.yml` | `k8s` (all 9) | Points containerd's `docker.io` resolution at the Harbor proxy cache | Idempotent, no-op once applied |
 | `cp-containerd-upgrade.yml` | `control_plane` | Pins `containerd.io` to `2.2.4-1~ubuntu.24.04~noble` | One-shot. Re-running is a package no-op but **still drains each CP node and restarts containerd** |
 | `kubelet-vm-lt-mount-ordering.yml` | `k8sworker01` only | Installs a kubelet drop-in requiring `/mnt/vm-lt` to be mounted | Idempotent; no kubelet restart |
+| `journald-persistent.yml` | `k8s` (all 9) | `Storage=persistent` + a 200M cap, so `journalctl -b -1` works after a reboot | Idempotent, no-op once applied; no drain or reboot |
 
 ### Conventions every playbook follows
 

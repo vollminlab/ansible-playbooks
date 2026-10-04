@@ -1,0 +1,109 @@
+---
+# Raise the inotify limits on every Kubernetes node.
+#
+# Background: Ubuntu ships fs.inotify.max_user_instances=128. That limit is per
+# user, and on a Kubernetes node almost everything that needs an inotify
+# instance runs as root: kubelet, systemd, and one containerd-shim per pod, each
+# holding 2-6 instances (one OOM-event watch per container). The budget is
+# therefore spent in proportion to the node's pod count.
+#
+# On 2026-10-04 k8sworker04 (54 pods) was at exactly 128/128 for root:
+# 105 of them were containerd-shims across 47 pods, the rest kubelet (7),
+# systemd (5) and friends. The visible symptom was
+#   kubectl logs -f ...  ->  failed to create fsnotify watcher: too many open files
+# for every pod on the node. The quieter risk is that the next container
+# started there cannot get its OOM watch.
+#
+# This was NOT a leak, and NOT a cluster-wide default problem. It was drift.
+# k8sworker01-03 already carried /etc/sysctl.d/99-kubelet-watches.conf (512
+# instances, 524288 watches), placed by hand on 2025-05-13 and never codified,
+# so every node built or rebuilt since then went without it:
+#
+#   node          limit  root in use
+#   k8sworker01     512  139
+#   k8sworker02     512  112
+#   k8sworker03     512  115
+#   k8sworker04     128  128   <- exhausted
+#   k8sworker05     128   85
+#   k8sworker06     128   70
+#   k8scp01-03      128   (17 pods each)
+#
+# This playbook codifies exactly what k8sworker01-03 already run -- same file
+# name, same values -- so those three converge without change and the rest
+# catch up. 512 leaves roughly 4x headroom over the busiest node today; it is
+# not a guess, it is the value three nodes have run on for 17 months.
+#
+# Applied live with `sysctl -p <file>`: no reboot, drain, or service restart,
+# and nothing running is affected. The verify step reads the value the KERNEL
+# reports, not the file, so a typo or a later-sorting sysctl.d file that
+# overrides this one fails the run instead of passing it.
+#
+# Idempotent and safe to re-run.
+#
+#   ansible-playbook playbooks/inotify-limits.yml --ask-vault-pass
+
+- name: Raise inotify limits on Kubernetes nodes
+  hosts: k8s
+  become: true
+  serial: 1
+  vars:
+    sysctl_file: /etc/sysctl.d/99-kubelet-watches.conf
+    max_user_instances: 512
+    max_user_watches: 524288
+  tasks:
+    - name: Install the inotify sysctl drop-in
+      copy:
+        dest: "{{ sysctl_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by ansible-playbooks/playbooks/inotify-limits.yml
+          # Root's inotify budget scales with pod count (one containerd-shim per
+          # pod, 2-6 instances each). Ubuntu's default of 128 runs out at ~50 pods.
+          fs.inotify.max_user_watches={{ max_user_watches }}
+          fs.inotify.max_user_instances={{ max_user_instances }}
+      register: dropin
+
+    - name: Apply it to the running kernel
+      command: sysctl -p {{ sysctl_file }}
+      when: dropin.changed
+      changed_when: true
+
+    - name: Verify the kernel's effective limits
+      command: sysctl -n fs.inotify.max_user_instances fs.inotify.max_user_watches
+      changed_when: false
+      register: effective
+      failed_when: >-
+        effective.stdout_lines | map('int') | list
+        != [max_user_instances, max_user_watches]
+      # The kernel's answer, not the file's contents, is the proof.
+
+    - name: Verify nothing in sysctl.d would override it at the next boot
+      shell: >-
+        systemd-analyze cat-config sysctl.d 2>/dev/null
+        | grep -E '^fs\.inotify\.max_user_(instances|watches)' | tail -2
+      changed_when: false
+      register: boot_order
+      failed_when: >-
+        ('fs.inotify.max_user_instances=' ~ max_user_instances) not in boot_order.stdout
+        or ('fs.inotify.max_user_watches=' ~ max_user_watches) not in boot_order.stdout
+      # sysctl.d files apply in lexical order and the last one wins. A later
+      # file that lowered either limit would pass the check above today and
+      # silently undo it on the next reboot.
+
+    - name: Report root's current inotify usage against the new limit
+      shell: |
+        t=0
+        for p in /proc/[0-9]*; do
+          [ "$(stat -c %u "$p" 2>/dev/null)" = 0 ] || continue
+          c=$(ls -l "$p/fd" 2>/dev/null | grep -c anon_inode:inotify)
+          t=$((t + c))
+        done
+        echo "$t"
+      changed_when: false
+      register: usage
+
+    - name: Show headroom
+      debug:
+        msg: "root inotify instances in use: {{ usage.stdout }} / {{ max_user_instances }}"

@@ -65,6 +65,7 @@ playbooks/
   containerd-dockerhub-mirror.yml    # route docker.io through the Harbor pull-through cache
   kubelet-vm-lt-mount-ordering.yml   # k8sworker01: order kubelet after the /mnt/vm-lt mount
   journald-persistent.yml            # keep the journal across reboots so shutdowns can be read back
+  inotify-limits.yml                 # raise root's inotify budget (scales with pods per node)
 ```
 
 There are no roles, no `group_vars`, and no `requirements.yml`. Every module used — `apt`, `command`,
@@ -82,6 +83,26 @@ There are no roles, no `group_vars`, and no `requirements.yml`. Every module use
 | `cp-containerd-upgrade.yml` | `control_plane` | Pins `containerd.io` to `2.2.4-1~ubuntu.24.04~noble` | One-shot. Re-running is a package no-op but **still drains each CP node and restarts containerd** |
 | `kubelet-vm-lt-mount-ordering.yml` | `k8sworker01` only | Installs a kubelet drop-in requiring `/mnt/vm-lt` to be mounted | Idempotent; no kubelet restart |
 | `journald-persistent.yml` | `k8s` (all 9) | `Storage=persistent` + a 200M cap, so `journalctl -b -1` works after a reboot | Idempotent, no-op once applied; no drain or reboot |
+| `inotify-limits.yml` | `k8s` (all 9) | `fs.inotify.max_user_instances=512`, `max_user_watches=524288`, applied live | Idempotent, no-op once applied; no drain, reboot or restart |
+
+### New node checklist
+
+A node built or rebuilt from the VM template has **none** of the settings below. Each one was found
+missing on some node only after it caused a problem. `inotify-limits.yml` exists because three
+workers were tuned by hand in 2025 and the six nodes built after them never were. Run these against
+the new node before it takes production workloads:
+
+```bash
+N=k8sworker07.vollminlab.com   # the new node's FQDN, as in hosts.ini
+ansible-playbook playbooks/containerd-dockerhub-mirror.yml --limit "$N" --ask-vault-pass
+ansible-playbook playbooks/journald-persistent.yml         --limit "$N" --ask-vault-pass
+ansible-playbook playbooks/inotify-limits.yml              --limit "$N" --ask-vault-pass
+# control-plane nodes only:
+ansible-playbook playbooks/harden-cp-probes.yml            --limit "$N" --ask-vault-pass
+```
+
+**When you add a playbook that every node needs, add it here too.** A setting that lives only in its
+own section gets applied once to the nodes that exist that day, and the next node goes without it.
 
 ### Conventions every playbook follows
 
@@ -484,6 +505,32 @@ left `apt-mark hold`.
 
 Run only when all etcd members are healthy. The control plane stays available throughout (nodes are
 drained and uncordoned one at a time).
+
+## inotify limits
+
+`inotify-limits.yml` writes `/etc/sysctl.d/99-kubelet-watches.conf` (512 instances, 524288 watches),
+applies it with `sysctl -p`, then verifies two things: the value the **kernel** reports, and that no
+later-sorting `sysctl.d` file would override it at the next boot. Both are needed. A file that is
+correct but overridden passes the first check and silently reverts on reboot.
+
+**Why it is needed.** The limit is per user, and nearly everything on a node that uses inotify
+runs as root: kubelet, systemd, and one `containerd-shim` per pod holding 2–6 instances (an OOM-event
+watch per container). Root's usage therefore grows with the pod count. Ubuntu's default of 128 ran
+out on k8sworker04 at 54 pods on 2026-10-04 (105 of the 128 were shims). Every `kubectl logs -f`
+against a pod on that node then failed with:
+
+```
+failed to create fsnotify watcher: too many open files
+```
+
+To see current usage on a node:
+
+```bash
+sudo bash -c 't=0; for p in /proc/[0-9]*; do [ "$(stat -c %u $p)" = 0 ] || continue;
+  t=$((t + $(ls -l $p/fd 2>/dev/null | grep -c anon_inode:inotify))); done; echo $t'
+```
+
+Applied to all 9 nodes on 2026-10-05; the busiest was then at 139/512.
 
 ## SSH keys
 
